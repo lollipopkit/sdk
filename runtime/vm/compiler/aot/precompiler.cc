@@ -36,6 +36,7 @@
 #include "vm/compiler/jit/compiler.h"
 #include "vm/dart_entry.h"
 #include "vm/exceptions.h"
+#include "vm/fcb_patch_entry.h"
 #include "vm/ffi/native_assets.h"
 #include "vm/flags.h"
 #include "vm/hash_table.h"
@@ -95,10 +96,21 @@ DECLARE_FLAG(int, inlining_caller_size_threshold);
 DECLARE_FLAG(int, inlining_constant_arguments_max_size_threshold);
 DECLARE_FLAG(int, inlining_constant_arguments_min_size_threshold);
 DECLARE_FLAG(bool, print_instruction_stats);
+DECLARE_FLAG(bool, fcb_enable_aot_dispatch);
+DECLARE_FLAG(bool, trace_fcb_dispatch);
 
 Precompiler* Precompiler::singleton_ = nullptr;
 
 #if defined(DART_PRECOMPILER) && !defined(TARGET_ARCH_IA32)
+
+static intptr_t FcbFixedUserArgumentCount(const Function& function) {
+  if (function.NumTypeParameters() != 0 || function.HasOptionalParameters()) {
+    return -1;
+  }
+  const intptr_t implicit_count = function.NumImplicitParameters();
+  const intptr_t fixed_count = function.num_fixed_parameters();
+  return fixed_count >= implicit_count ? fixed_count - implicit_count : -1;
+}
 
 // Reasons for retaining a given object.
 struct RetainReasons : public AllStatic {
@@ -2121,13 +2133,57 @@ void Precompiler::ReplaceFunctionStaticCallEntries() {
         target_code_ = target_function_.CurrentCode();
         ASSERT(!target_code_.IsStubCode());
         view.Set<Code::kSCallTableCodeOrTypeTarget>(target_code_);
+        const bool fcb_probe_target =
+            FLAG_fcb_enable_aot_dispatch &&
+            fcb::ShouldProbeFunction(Thread::Current(), target_function_);
+        if (FLAG_trace_fcb_dispatch && fcb_probe_target) {
+          OS::PrintErr("FCB precompiler static-call probe target=%s id=%s "
+                       "fixed=%" Pd " implicit=%" Pd " total=%" Pd
+                       " optional=%s type_params=%" Pd " caller=%s\n",
+                       target_function_.ToFullyQualifiedCString(),
+                       fcb::FunctionIdFor(target_function_).c_str(),
+                       target_function_.num_fixed_parameters(),
+                       target_function_.NumImplicitParameters(),
+                       target_function_.NumParameters(),
+                       target_function_.HasOptionalParameters() ? "true"
+                                                                : "false",
+                       target_function_.NumTypeParameters(), code.ToCString());
+        }
+        // AOT relocation and snapshot writing expect Function targets to have
+        // been resolved to Code targets by this pass.
         view.Set<Code::kSCallTableFunctionTarget>(Object::null_function());
         if (kind == Code::kCallViaCode) {
           auto const pc_offset =
               Code::OffsetField::decode(kind_and_offset_.Value());
           const uword pc = pc_offset + code.PayloadStart();
-          CodePatcher::PatchStaticCallAt(pc, code, target_code_);
-          builder.AddObject(Object::ZoneHandle(target_code_.ptr()));
+          CodePtr fcb_call_target = Code::null();
+          if (fcb_probe_target) {
+            switch (FcbFixedUserArgumentCount(target_function_)) {
+              case 0:
+                fcb_call_target = StubCode::FcbAotStaticCall().ptr();
+                break;
+              case 1:
+                fcb_call_target = StubCode::FcbAotStaticCall1().ptr();
+                break;
+              case 2:
+                fcb_call_target = StubCode::FcbAotStaticCall2().ptr();
+                break;
+              case 3:
+                fcb_call_target = StubCode::FcbAotStaticCall3().ptr();
+                break;
+              case 4:
+                fcb_call_target = StubCode::FcbAotStaticCall4().ptr();
+                break;
+              default:
+                fcb_call_target = Code::null();
+                break;
+            }
+          }
+          const Code& call_target = Code::ZoneHandle(
+              fcb_call_target == Code::null() ? target_code_.ptr()
+                                              : fcb_call_target);
+          CodePatcher::PatchStaticCallAt(pc, code, call_target);
+          builder.AddObject(Object::ZoneHandle(call_target.ptr()));
         }
         if (FLAG_trace_precompiler) {
           THR_Print("Updated static call entry to %s in \"%s\"\n",

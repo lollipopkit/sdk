@@ -11,6 +11,7 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "include/dart_api.h"
@@ -21,6 +22,7 @@
 #include "vm/class_table.h"
 #include "vm/dispatch_table.h"
 #include "vm/exceptions.h"
+#include "vm/fcb_patch_runtime.h"
 #include "vm/ffi_callback_metadata.h"
 #include "vm/field_table.h"
 #include "vm/fixed_cache.h"
@@ -555,6 +557,12 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
 
   StoreBuffer* store_buffer() const { return store_buffer_.get(); }
   ObjectStore* object_store() const { return object_store_.get(); }
+  fcb::PatchRuntime* fcb_patch_runtime() const {
+    return fcb_patch_runtime_.get();
+  }
+  bool LoadFcbPatchRuntimeFromFile(const char* path, std::string* error);
+  fcb::PatchRuntime* EnsureFcbPatchRuntime();
+  void ClearFcbPatchRuntime();
   Mutex* symbols_mutex() { return &symbols_mutex_; }
   Mutex* type_canonicalization_mutex() { return &type_canonicalization_mutex_; }
   Mutex* type_arguments_canonicalization_mutex() {
@@ -885,6 +893,8 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
   AcqRelAtomic<ClassPtr*> cached_class_table_table_;
   std::unique_ptr<ObjectStore> object_store_;
   // End accessed from generated code.
+
+  std::unique_ptr<fcb::PatchRuntime> fcb_patch_runtime_;
 
   ClassTableAllocator class_table_allocator_;
   ClassTable* heap_walk_class_table_;

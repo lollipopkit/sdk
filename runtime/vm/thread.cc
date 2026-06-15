@@ -117,6 +117,7 @@ Thread::Thread(bool is_vm_isolate)
 
 #define DEFAULT_INIT(name) name##_entry_point_ = 0;
   RUNTIME_ENTRY_LIST(DEFAULT_INIT)
+  FCB_RUNTIME_ENTRY_LIST(DEFAULT_INIT)
 #undef DEFAULT_INIT
 
 #define DEFAULT_INIT(returntype, name, ...) name##_entry_point_ = 0;
@@ -209,6 +210,7 @@ void Thread::InitVMConstants() {
   ASSERT(name##_entry_point_ == 0);                                            \
   name##_entry_point_ = k##name##RuntimeEntry.GetEntryPoint();
   RUNTIME_ENTRY_LIST(INIT_VALUE)
+  FCB_RUNTIME_ENTRY_LIST(INIT_VALUE)
 #undef INIT_VALUE
 
 #define INIT_VALUE(returntype, name, ...)                                      \
@@ -1356,6 +1358,7 @@ intptr_t Thread::OffsetFromThread(const RuntimeEntry* runtime_entry) {
     return Thread::name##_entry_point_offset();                                \
   }
   RUNTIME_ENTRY_LIST(COMPUTE_OFFSET)
+  FCB_RUNTIME_ENTRY_LIST(COMPUTE_OFFSET)
 #undef COMPUTE_OFFSET
 
 #define COMPUTE_OFFSET(returntype, name, ...)                                  \

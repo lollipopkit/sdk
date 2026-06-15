@@ -5,6 +5,7 @@
 #include "vm/runtime_entry.h"
 
 #include <memory>
+#include <vector>
 
 #include "platform/address_sanitizer.h"
 #include "platform/globals.h"
@@ -22,6 +23,7 @@
 #include "vm/debugger.h"
 #include "vm/double_conversion.h"
 #include "vm/exceptions.h"
+#include "vm/fcb_patch_entry.h"
 #include "vm/ffi_callback_metadata.h"
 #include "vm/flags.h"
 #include "vm/heap/verifier.h"
@@ -79,6 +81,316 @@ DEFINE_FLAG(bool,
             trace_deoptimization_verbose,
             false,
             "Trace deoptimization verbose");
+DECLARE_FLAG(bool, trace_fcb_dispatch);
+
+namespace {
+
+FunctionPtr ProbeTargetFromStack(Thread* thread, Zone* zone);
+void FcbTraceStaticCallFrames(Thread* thread, Zone* zone, const char* reason);
+
+void TryFcbPatchCall(Thread* thread,
+                     Zone* zone,
+                     NativeArguments arguments,
+                     intptr_t argument_count) {
+  const Function& function = Function::CheckedHandle(zone, arguments.ArgAt(0));
+  std::vector<ObjectPtr> call_arguments;
+  call_arguments.reserve(argument_count);
+  for (intptr_t i = 0; i < argument_count; ++i) {
+    call_arguments.push_back(arguments.ArgAt(i + 1));
+  }
+
+  ObjectPtr result = Object::sentinel().ptr();
+  if (fcb::IsFunctionPatched(thread, function) &&
+      fcb::TryInvokePatchedFunction(thread, function, call_arguments, &result)) {
+    arguments.SetReturn(Object::Handle(zone, result));
+    return;
+  }
+  if (fcb::TryInvokeUniquePatchedFunctionByArity(thread, call_arguments,
+                                                 &result)) {
+    arguments.SetReturn(Object::Handle(zone, result));
+    return;
+  }
+  arguments.SetReturn(Object::sentinel());
+}
+
+void TryFcbPatchStaticCallAot(Thread* thread,
+                              Zone* zone,
+                              NativeArguments arguments,
+                              intptr_t max_supported_argument_count) {
+  const Object& descriptor_obj = Object::Handle(zone, arguments.ArgAt(0));
+  intptr_t argument_count = 0;
+  const bool descriptorless_nullary = descriptor_obj.IsNull();
+  const bool descriptorless_fixed_arity = descriptor_obj.IsSmi();
+  if (descriptorless_fixed_arity) {
+    argument_count = Smi::Cast(descriptor_obj).Value();
+    if (argument_count < 0 ||
+        argument_count > max_supported_argument_count) {
+      arguments.SetReturn(Object::sentinel());
+      return;
+    }
+  } else if (!descriptorless_nullary) {
+    const Array& descriptor = Array::CheckedHandle(zone, descriptor_obj.ptr());
+    const ArgumentsDescriptor args_desc(descriptor);
+    argument_count = args_desc.Count();
+    if (args_desc.TypeArgsLen() != 0 ||
+        args_desc.PositionalCount() != argument_count ||
+        argument_count > max_supported_argument_count) {
+      if (FLAG_trace_fcb_dispatch) {
+        OS::PrintErr("FCB AOT dispatch skipped: unsupported args "
+                     "count=%" Pd " positional=%" Pd " type_args=%" Pd
+                     " max=%" Pd "\n",
+                     argument_count, args_desc.PositionalCount(),
+                     args_desc.TypeArgsLen(), max_supported_argument_count);
+      }
+      arguments.SetReturn(Object::sentinel());
+      return;
+    }
+  }
+
+  ObjectPtr call_arguments[4];
+  for (intptr_t i = 0; i < argument_count; ++i) {
+    call_arguments[i] =
+        (i + 1 < arguments.ArgCount()) ? arguments.ArgAt(i + 1)
+                                       : Object::null();
+  }
+
+  const Function& function =
+      Function::Handle(zone, ProbeTargetFromStack(thread, zone));
+
+  if (function.IsNull()) {
+    if (FLAG_trace_fcb_dispatch) {
+      OS::PrintErr("FCB AOT dispatch skipped: unresolved static target\n");
+      FcbTraceStaticCallFrames(thread, zone, "dispatch unresolved target");
+    }
+    arguments.SetReturn(Object::sentinel());
+    return;
+  }
+  if (FLAG_trace_fcb_dispatch) {
+    OS::PrintErr("FCB AOT dispatch target=%s id=%s args=%" Pd "%s\n",
+                 function.ToFullyQualifiedCString(),
+                 fcb::FunctionIdFor(function).c_str(), argument_count,
+                 (descriptorless_nullary || descriptorless_fixed_arity)
+                     ? " descriptorless"
+                     : "");
+  }
+
+  ObjectPtr result = Object::sentinel().ptr();
+  fcb::ReturnConvention return_convention = fcb::ReturnConvention::kTagged;
+  if (fcb::TryInvokePatchedAotFunction(thread, zone, function, call_arguments,
+                                       argument_count, &result,
+                                       &return_convention)) {
+    if (FLAG_trace_fcb_dispatch) {
+      OS::PrintErr("FCB AOT dispatch handled target=%s\n",
+                   function.ToFullyQualifiedCString());
+    }
+    arguments.SetReturn(Object::Handle(zone, result));
+    return;
+  }
+  const Code& target_code = Code::Handle(zone, function.CurrentCode());
+  if (!target_code.IsNull()) {
+    if (FLAG_trace_fcb_dispatch) {
+      OS::PrintErr("FCB AOT dispatch missed target=%s; using original code\n",
+                   function.ToFullyQualifiedCString());
+    }
+    arguments.SetReturn(target_code);
+    return;
+  }
+  if (FLAG_trace_fcb_dispatch) {
+    OS::PrintErr("FCB AOT dispatch missed target=%s target_code_null=true\n",
+                 function.ToFullyQualifiedCString());
+  }
+  arguments.SetReturn(Object::sentinel());
+}
+
+FunctionPtr StaticCallTargetFromFrame(Thread* thread,
+                                      Zone* zone,
+                                      StackFrame* caller_frame) {
+  ASSERT(caller_frame != nullptr);
+  ASSERT(caller_frame->IsDartFrame());
+  const Code& caller_code = Code::Handle(zone, caller_frame->LookupDartCode());
+  if (caller_code.IsNull()) {
+    return Function::null();
+  }
+  const uword caller_pc = caller_frame->pc();
+  const uword candidate_pcs[] = {
+      caller_pc,
+#if defined(TARGET_ARCH_ARM64)
+      caller_pc + Instr::kInstrSize,
+      caller_pc - Instr::kInstrSize,
+#endif
+  };
+  for (uword pc : candidate_pcs) {
+    if (!caller_code.ContainsInstructionAt(pc)) {
+      continue;
+    }
+    FunctionPtr function = caller_code.GetStaticCallTargetFunctionAt(pc);
+    if (function != Function::null()) {
+      return function;
+    }
+
+    const Code& target_code =
+        Code::Handle(zone, caller_code.GetStaticCallTargetCodeAt(pc));
+    if (!target_code.IsNull() && target_code.IsFunctionCode()) {
+      return target_code.function();
+    }
+  }
+  return Function::null();
+}
+
+FunctionPtr UniqueProbeTargetFromCode(Thread* thread,
+                                      Zone* zone,
+                                      const Code& code) {
+  if (code.IsNull() || code.static_calls_target_table() == Array::null()) {
+    return Function::null();
+  }
+
+  const Array& array = Array::Handle(zone, code.static_calls_target_table());
+  StaticCallsTable entries(array);
+  Function& candidate = Function::Handle(zone);
+  Function& selected = Function::Handle(zone);
+  Code& target_code = Code::Handle(zone);
+  intptr_t matches = 0;
+  for (intptr_t i = 0; i < entries.Length(); ++i) {
+    candidate = entries[i].Get<Code::kSCallTableFunctionTarget>();
+    if (candidate.IsNull()) {
+      const Object& target =
+          Object::Handle(zone, entries[i].Get<Code::kSCallTableCodeOrTypeTarget>());
+      if (target.IsCode()) {
+        target_code ^= Code::Cast(target).ptr();
+        if (!target_code.IsNull() && target_code.IsFunctionCode()) {
+          candidate = target_code.function();
+        }
+      }
+    }
+    if (!candidate.IsNull() && fcb::ShouldProbeFunction(thread, candidate)) {
+      selected = candidate.ptr();
+      matches++;
+      if (matches > 1) {
+        return Function::null();
+      }
+    }
+  }
+  return matches == 1 ? selected.ptr() : Function::null();
+}
+
+FunctionPtr ProbeTargetFromFrame(Thread* thread,
+                                 Zone* zone,
+                                 StackFrame* caller_frame) {
+  ASSERT(caller_frame != nullptr);
+  ASSERT(caller_frame->IsDartFrame());
+  const Function& direct =
+      Function::Handle(zone, StaticCallTargetFromFrame(thread, zone,
+                                                       caller_frame));
+  if (!direct.IsNull()) {
+    return direct.ptr();
+  }
+
+  const Code& caller_code = Code::Handle(zone, caller_frame->LookupDartCode());
+  const Function& unique =
+      Function::Handle(zone, UniqueProbeTargetFromCode(thread, zone, caller_code));
+  if (!unique.IsNull()) {
+    return unique.ptr();
+  }
+  return Function::null();
+}
+
+FunctionPtr ProbeTargetFromStack(Thread* thread, Zone* zone) {
+  StackFrameIterator iterator(ValidationPolicy::kDontValidateFrames, thread,
+                              StackFrameIterator::kNoCrossThreadIteration);
+  StackFrame* frame = iterator.NextFrame();
+  intptr_t depth = 0;
+  while (frame != nullptr && depth < 12) {
+    if (frame->IsDartFrame()) {
+      const Function& function =
+          Function::Handle(zone, ProbeTargetFromFrame(thread, zone, frame));
+      if (!function.IsNull()) {
+        return function.ptr();
+      }
+    }
+    frame = iterator.NextFrame();
+    depth++;
+  }
+  return Function::null();
+}
+
+void FcbTraceStaticCallFrames(Thread* thread, Zone* zone, const char* reason) {
+  if (!FLAG_trace_fcb_dispatch) {
+    return;
+  }
+  OS::PrintErr("FCB AOT frame scan failed: %s\n", reason);
+  StackFrameIterator iterator(ValidationPolicy::kDontValidateFrames, thread,
+                              StackFrameIterator::kNoCrossThreadIteration);
+  StackFrame* frame = iterator.NextFrame();
+  intptr_t depth = 0;
+  while (frame != nullptr && depth < 12) {
+    if (!frame->IsDartFrame()) {
+      OS::PrintErr("FCB AOT frame[%" Pd "] non-dart stub=%s exit=%s pc=%#" Px
+                   "\n",
+                   depth, frame->IsStubFrame() ? "true" : "false",
+                   frame->IsExitFrame() ? "true" : "false", frame->pc());
+      frame = iterator.NextFrame();
+      depth++;
+      continue;
+    }
+
+    const Code& code = Code::Handle(zone, frame->LookupDartCode());
+    const Function& function =
+        Function::Handle(zone, code.IsNull()
+                                   ? Function::null()
+                                   : StaticCallTargetFromFrame(thread, zone,
+                                                               frame));
+    const Function& probe =
+        Function::Handle(zone, code.IsNull()
+                                   ? Function::null()
+                                   : UniqueProbeTargetFromCode(thread, zone,
+                                                               code));
+    OS::PrintErr("FCB AOT frame[%" Pd
+                 "] dart pc=%#" Px " code=%s target=%s unique_probe=%s\n",
+                 depth, frame->pc(),
+                 code.IsNull() ? "<null>" : code.ToCString(),
+                 function.IsNull() ? "<null>"
+                                   : function.ToFullyQualifiedCString(),
+                 probe.IsNull() ? "<null>" : probe.ToFullyQualifiedCString());
+    frame = iterator.NextFrame();
+    depth++;
+  }
+}
+
+StackFrame* FcbStaticCallCallerFrameForTarget(Thread* thread,
+                                              Zone* zone,
+                                              bool require_probe_target) {
+  StackFrameIterator iterator(ValidationPolicy::kDontValidateFrames, thread,
+                              StackFrameIterator::kNoCrossThreadIteration);
+  StackFrame* caller_frame = iterator.NextFrame();
+  while (caller_frame != nullptr) {
+    if (!caller_frame->IsStubFrame() && !caller_frame->IsExitFrame() &&
+        caller_frame->IsDartFrame()) {
+      const Function& function =
+          Function::Handle(zone, require_probe_target
+                                     ? ProbeTargetFromFrame(thread, zone,
+                                                            caller_frame)
+                                     : StaticCallTargetFromFrame(thread, zone,
+                                                                 caller_frame));
+      if (!function.IsNull()) {
+        return caller_frame;
+      }
+    }
+    caller_frame = iterator.NextFrame();
+  }
+  return nullptr;
+}
+
+[[maybe_unused]] FunctionPtr StaticCallTargetFromCaller(Thread* thread,
+                                                        Zone* zone) {
+  StackFrame* caller_frame =
+      FcbStaticCallCallerFrameForTarget(thread, zone, true);
+  if (caller_frame == nullptr || !caller_frame->IsDartFrame()) {
+    return Function::null();
+  }
+  return StaticCallTargetFromFrame(thread, zone, caller_frame);
+}
+
+}  // namespace
 
 DECLARE_FLAG(int, max_deoptimization_counter_threshold);
 DECLARE_FLAG(bool, trace_compiler);
@@ -1577,6 +1889,113 @@ DEFINE_RUNTIME_ENTRY(CheckFunctionArgumentTypes, 3) {
 #endif  // defined(DART_DYNAMIC_MODULES)
 }
 
+// Attempts to invoke an FCB-patched target with no explicit arguments.
+// Arg0: function.
+// Return value: patch result, ErrorPtr, or Object::sentinel() when no FCB patch
+// applies and the caller should continue to the original function entry.
+DEFINE_RUNTIME_ENTRY(FcbPatchCall0, 1) {
+  TryFcbPatchCall(thread, zone, arguments, 0);
+}
+
+// Attempts to invoke an FCB-patched target with one explicit argument.
+// Arg0: function.
+// Arg1: argument 0.
+// Return value: patch result, ErrorPtr, or Object::sentinel() when no FCB patch
+// applies and the caller should continue to the original function entry.
+DEFINE_RUNTIME_ENTRY(FcbPatchCall1, 2) {
+  TryFcbPatchCall(thread, zone, arguments, 1);
+}
+
+// Attempts to invoke an FCB-patched target with two explicit arguments.
+// Arg0: function.
+// Arg1: argument 0.
+// Arg2: argument 1.
+// Return value: patch result, ErrorPtr, or Object::sentinel() when no FCB patch
+// applies and the caller should continue to the original function entry.
+DEFINE_RUNTIME_ENTRY(FcbPatchCall2, 3) {
+  TryFcbPatchCall(thread, zone, arguments, 2);
+}
+
+// Attempts to invoke an FCB-patched target with three explicit arguments.
+// Arg0: function.
+// Arg1: argument 0.
+// Arg2: argument 1.
+// Arg3: argument 2.
+// Return value: patch result, ErrorPtr, or Object::sentinel() when no FCB patch
+// applies and the caller should continue to the original function entry.
+DEFINE_RUNTIME_ENTRY(FcbPatchCall3, 4) {
+  TryFcbPatchCall(thread, zone, arguments, 3);
+}
+
+// Attempts to invoke an FCB-patched target from a precompiled
+// CallStaticFunction stub.
+// Arg0: arguments descriptor, or null for a descriptor-less nullary AOT call.
+// Arg1..Arg3: positional arguments 0..2 or null placeholders.
+// Return value: patch result, target Code when no FCB patch applies, or
+// Object::sentinel() when the original target could not be resolved.
+DEFINE_RUNTIME_ENTRY(FcbPatchStaticCallAot, 4) {
+  TryFcbPatchStaticCallAot(thread, zone, arguments, 4);
+}
+
+// Arg0: arguments descriptor, or null for a descriptor-less nullary AOT call.
+// Arg1..Arg4: positional arguments 0..3 or null placeholders.
+// Return value: patch result, target Code when no FCB patch applies, or
+// Object::sentinel() when the original target could not be resolved.
+DEFINE_RUNTIME_ENTRY(FcbPatchStaticCallAot4, 5) {
+  TryFcbPatchStaticCallAot(thread, zone, arguments, 4);
+}
+
+// Resolves the original static-call target for a callsite that was rewritten to
+// FcbAotStaticCall by the AOT precompiler.
+//
+// Return value: the target Code object, or Object::sentinel() if the caller is
+// not a resolvable static callsite.
+DEFINE_RUNTIME_ENTRY(FcbResolveStaticCallAot, 0) {
+  StackFrame* caller_frame =
+      FcbStaticCallCallerFrameForTarget(thread, zone, true);
+  if (caller_frame == nullptr || !caller_frame->IsDartFrame()) {
+    if (FLAG_trace_fcb_dispatch) {
+      OS::PrintErr("FCB AOT resolve skipped: no Dart caller frame\n");
+      FcbTraceStaticCallFrames(thread, zone, "resolve no probe target");
+    }
+    arguments.SetReturn(Object::sentinel());
+    return;
+  }
+
+  const Code& caller_code = Code::Handle(zone, caller_frame->LookupDartCode());
+  if (caller_code.IsNull()) {
+    if (FLAG_trace_fcb_dispatch) {
+      OS::PrintErr("FCB AOT resolve skipped: caller code is null\n");
+    }
+    arguments.SetReturn(Object::sentinel());
+    return;
+  }
+
+  const Function& target_function =
+      Function::Handle(zone, ProbeTargetFromFrame(thread, zone, caller_frame));
+  if (target_function.IsNull()) {
+    if (FLAG_trace_fcb_dispatch) {
+      OS::PrintErr("FCB AOT resolve skipped: target_function_null=true\n");
+    }
+    arguments.SetReturn(Object::sentinel());
+    return;
+  }
+  const Code& target_code = Code::Handle(zone, target_function.CurrentCode());
+  if (target_code.IsNull()) {
+    if (FLAG_trace_fcb_dispatch) {
+      OS::PrintErr("FCB AOT resolve skipped: target_code_null=true target=%s\n",
+                   target_function.ToFullyQualifiedCString());
+    }
+    arguments.SetReturn(Object::sentinel());
+    return;
+  }
+  if (FLAG_trace_fcb_dispatch) {
+    OS::PrintErr("FCB AOT resolve target=%s\n",
+                 target_function.ToFullyQualifiedCString());
+  }
+  arguments.SetReturn(target_code);
+}
+
 // Helper routine for tracing a type check.
 static void PrintTypeCheck(const char* message,
                            const Instance& instance,
@@ -2223,7 +2642,16 @@ DEFINE_RUNTIME_ENTRY(PatchStaticCall, 0) {
   }
   arguments.SetReturn(target_code);
 #else
-  UNREACHABLE();
+  const Function& target_function =
+      Function::Handle(zone, StaticCallTargetFromCaller(thread, zone));
+  RELEASE_ASSERT(!target_function.IsNull());
+  ASSERT(target_function.HasCode());
+  if (fcb::ShouldProbeFunction(thread, target_function)) {
+    arguments.SetReturn(StubCode::FcbAotStaticCall());
+    return;
+  }
+  const Code& target_code = Code::Handle(zone, target_function.CurrentCode());
+  arguments.SetReturn(target_code);
 #endif
 }
 

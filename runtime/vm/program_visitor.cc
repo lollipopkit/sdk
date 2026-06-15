@@ -10,12 +10,15 @@
 #include "vm/closure_functions_cache.h"
 #include "vm/code_patcher.h"
 #include "vm/deopt_instructions.h"
+#include "vm/fcb_patch_entry.h"
 #include "vm/hash_map.h"
 #include "vm/object.h"
 #include "vm/object_store.h"
 #include "vm/symbols.h"
 
 namespace dart {
+
+DECLARE_FLAG(bool, fcb_enable_aot_dispatch);
 
 class WorklistElement : public ZoneObject {
  public:
@@ -357,8 +360,11 @@ void ProgramVisitor::BindStaticCalls(Thread* thread) {
 
       StaticCallsTable static_calls(table_);
       // We can only remove the target table in precompiled mode, since more
-      // calls may be added later otherwise.
-      bool only_call_via_code = FLAG_precompiled_mode;
+      // calls may be added later otherwise. FCB AOT dispatch keeps the table
+      // as metadata for later patch lookup and to retain static-call targets
+      // through snapshot writing.
+      bool only_call_via_code =
+          FLAG_precompiled_mode && !FLAG_fcb_enable_aot_dispatch;
       for (const auto& view : static_calls) {
         kind_and_offset_ = view.Get<Code::kSCallTableKindAndOffset>();
         auto const kind = Code::KindField::decode(kind_and_offset_.Value());
@@ -389,10 +395,10 @@ void ProgramVisitor::BindStaticCalls(Thread* thread) {
         //
         // In precompiled mode, the binder runs after tree shaking, during which
         // all targets have been compiled, and so the binder replaces all static
-        // calls with direct calls to the target.
-        //
-        // Cf. runtime entry PatchStaticCall called from CallStaticFunction
-        // stub.
+        // calls with direct calls to the target. FCB AOT dispatch still needs
+        // these direct calls for no-patch startup; the static call table is kept
+        // above as metadata instead of being used to route every call through
+        // the JIT-oriented CallStaticFunction stub.
         const auto& fun = Function::Cast(target_);
         ASSERT(!FLAG_precompiled_mode || fun.HasCode());
         target_code_ = fun.HasCode() ? fun.CurrentCode()

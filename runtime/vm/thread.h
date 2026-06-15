@@ -827,6 +827,7 @@ class Thread : public ThreadState, public IntrusiveDListEntry<Thread> {
     return OFFSET_OF(Thread, name##_entry_point_);                             \
   }
   RUNTIME_ENTRY_LIST(DEFINE_OFFSET_METHOD)
+  FCB_RUNTIME_ENTRY_LIST(DEFINE_OFFSET_METHOD)
 #undef DEFINE_OFFSET_METHOD
 
 #define DEFINE_OFFSET_METHOD(returntype, name, ...)                            \
@@ -1755,6 +1756,11 @@ class Thread : public ThreadState, public IntrusiveDListEntry<Thread> {
   friend Isolate* CreateWithinExistingIsolateGroup(IsolateGroup*,
                                                    const char*,
                                                    char**);
+
+#define DECLARE_MEMBERS(name) uword name##_entry_point_ = 0;
+  FCB_RUNTIME_ENTRY_LIST(DECLARE_MEMBERS)
+#undef DECLARE_MEMBERS
+
   DISALLOW_COPY_AND_ASSIGN(Thread);
 };
 

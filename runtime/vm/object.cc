@@ -18413,7 +18413,7 @@ void Code::set_deopt_info_array(const Array& array) const {
 
 void Code::set_static_calls_target_table(const Array& value) const {
 #if defined(DART_PRECOMPILED_RUNTIME)
-  UNREACHABLE();
+  untag()->set_code_source_map(static_cast<CodeSourceMapPtr>(value.ptr()));
 #else
   untag()->set_static_calls_target_table(value.ptr());
 #endif
@@ -18483,21 +18483,24 @@ TypedDataPtr Code::GetDeoptInfoAtPc(uword pc,
 #endif  // defined(DART_PRECOMPILED_RUNTIME)
 }
 
-intptr_t Code::BinarySearchInSCallTable(uword pc) const {
-#if defined(DART_PRECOMPILED_RUNTIME)
-  UNREACHABLE();
-#else
+intptr_t Code::BinarySearchInSCallTable(uword pc,
+                                        bool allow_return_pc) const {
   NoSafepointScope no_safepoint;
-  const Array& table = Array::Handle(untag()->static_calls_target_table());
+  const Array& table = Array::Handle(static_calls_target_table());
+  if (table.IsNull() || table.Length() == 0) {
+    return -1;
+  }
   StaticCallsTable entries(table);
   const intptr_t pc_offset = pc - PayloadStart();
   intptr_t imin = 0;
   intptr_t imax = (table.Length() / kSCallTableEntryLength) - 1;
+  intptr_t nearest_lower = -1;
   while (imax >= imin) {
     const intptr_t imid = imin + (imax - imin) / 2;
     const auto offset = OffsetField::decode(
         Smi::Value(entries[imid].Get<kSCallTableKindAndOffset>()));
     if (offset < pc_offset) {
+      nearest_lower = imid;
       imin = imid + 1;
     } else if (offset > pc_offset) {
       imax = imid - 1;
@@ -18505,23 +18508,107 @@ intptr_t Code::BinarySearchInSCallTable(uword pc) const {
       return imid;
     }
   }
+  if (allow_return_pc && nearest_lower >= 0) {
+    const auto offset = OffsetField::decode(
+        Smi::Value(entries[nearest_lower].Get<kSCallTableKindAndOffset>()));
+    const intptr_t delta = pc_offset - offset;
+    // Runtime static-call stubs observe the Dart caller's return PC, while the
+    // static-call table stores the call instruction PC.
+#if defined(TARGET_ARCH_X64)
+    constexpr intptr_t kStaticCallReturnPcDelta = 5;
+#elif defined(TARGET_ARCH_ARM) || defined(TARGET_ARCH_ARM64)
+    constexpr intptr_t kStaticCallReturnPcDelta = 4;
+#else
+    constexpr intptr_t kStaticCallReturnPcDelta = 0;
 #endif
+    if (delta == kStaticCallReturnPcDelta) {
+      return nearest_lower;
+    }
+  }
   return -1;
 }
 
 FunctionPtr Code::GetStaticCallTargetFunctionAt(uword pc) const {
-#if defined(DART_PRECOMPILED_RUNTIME)
-  UNREACHABLE();
-  return Function::null();
-#else
-  const intptr_t i = BinarySearchInSCallTable(pc);
+  const intptr_t i = BinarySearchInSCallTable(pc, /*allow_return_pc=*/true);
   if (i < 0) {
     return Function::null();
   }
-  const Array& array = Array::Handle(untag()->static_calls_target_table());
+  const Array& array = Array::Handle(static_calls_target_table());
   StaticCallsTable entries(array);
   return entries[i].Get<kSCallTableFunctionTarget>();
-#endif
+}
+
+CodePtr Code::GetStaticCallTargetCodeAt(uword pc) const {
+  const intptr_t i = BinarySearchInSCallTable(pc, /*allow_return_pc=*/true);
+  if (i < 0) {
+    return Code::null();
+  }
+  const Array& array = Array::Handle(static_calls_target_table());
+  StaticCallsTable entries(array);
+  const Object& target =
+      Object::Handle(entries[i].Get<kSCallTableCodeOrTypeTarget>());
+  if (!target.IsCode()) {
+    return Code::null();
+  }
+  return Code::Cast(target).ptr();
+}
+
+uword Code::GetStaticCallTargetEntryPointAt(uword pc) const {
+  const intptr_t i = BinarySearchInSCallTable(pc, /*allow_return_pc=*/true);
+  if (i < 0) {
+    return 0;
+  }
+  const Array& array = Array::Handle(static_calls_target_table());
+  StaticCallsTable entries(array);
+  const Object& target =
+      Object::Handle(entries[i].Get<kSCallTableCodeOrTypeTarget>());
+  if (!target.IsCode()) {
+    return 0;
+  }
+  const Code& code = Code::Cast(target);
+  const Smi& kind_and_offset =
+      Smi::Handle(entries[i].Get<kSCallTableKindAndOffset>());
+  const bool call_via_code =
+      KindField::decode(kind_and_offset.Value()) == kCallViaCode;
+  switch (EntryPointField::decode(kind_and_offset.Value())) {
+    case kDefaultEntry:
+      return call_via_code ? code.MonomorphicEntryPoint() : code.EntryPoint();
+    case kUncheckedEntry:
+      return call_via_code ? code.MonomorphicUncheckedEntryPoint()
+                           : code.UncheckedEntryPoint();
+  }
+  UNREACHABLE();
+  return 0;
+}
+
+intptr_t Code::GetStaticCallTargetEntryPointOffsetAt(uword pc) const {
+  const intptr_t i = BinarySearchInSCallTable(pc, /*allow_return_pc=*/true);
+  if (i < 0) {
+    return -1;
+  }
+  const Array& array = Array::Handle(static_calls_target_table());
+  StaticCallsTable entries(array);
+  const Object& target =
+      Object::Handle(entries[i].Get<kSCallTableCodeOrTypeTarget>());
+  if (!target.IsCode()) {
+    return -1;
+  }
+  const Smi& kind_and_offset =
+      Smi::Handle(entries[i].Get<kSCallTableKindAndOffset>());
+  const Code& code = Code::Cast(target);
+  const bool call_via_code =
+      KindField::decode(kind_and_offset.Value()) == kCallViaCode;
+  switch (EntryPointField::decode(kind_and_offset.Value())) {
+    case kDefaultEntry:
+      return call_via_code ? code.entry_point_offset(EntryKind::kMonomorphic)
+                           : code.entry_point_offset(EntryKind::kNormal);
+    case kUncheckedEntry:
+      return call_via_code
+                 ? code.entry_point_offset(EntryKind::kMonomorphicUnchecked)
+                 : code.entry_point_offset(EntryKind::kUnchecked);
+  }
+  UNREACHABLE();
+  return -1;
 }
 
 void Code::SetStaticCallTargetCodeAt(uword pc, const Code& code) const {

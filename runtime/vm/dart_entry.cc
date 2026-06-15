@@ -10,6 +10,7 @@
 #include "vm/class_finalizer.h"
 #include "vm/debugger.h"
 #include "vm/dispatch_table.h"
+#include "vm/fcb_patch_entry.h"
 #include "vm/heap/safepoint.h"
 #include "vm/interpreter.h"
 #include "vm/log.h"
@@ -138,6 +139,11 @@ ObjectPtr DartEntry::InvokeFunction(const Function& function,
   Thread* thread = Thread::Current();
   ASSERT(thread->IsDartMutatorThread());
   ASSERT(!function.IsNull());
+
+  ObjectPtr fcb_result = Object::null();
+  if (fcb::TryInvokePatchedFunction(thread, function, arguments, &fcb_result)) {
+    return fcb_result;
+  }
 
 #if defined(DART_DYNAMIC_MODULES)
   if (function.IsInterpreted()) {

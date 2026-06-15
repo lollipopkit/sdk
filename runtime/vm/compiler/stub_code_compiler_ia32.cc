@@ -516,6 +516,58 @@ void StubCodeCompiler::GenerateCallBootstrapNativeStub() {
 // Input parameters:
 //   ARGS_DESC_REG: arguments descriptor array.
 void StubCodeCompiler::GenerateCallStaticFunctionStub() {
+  Label no_fcb_patch, fcb_count_zero, fcb_count_one, fcb_count_two;
+  const Immediate& raw_null = Immediate(target::ToRawPointer(NullObject()));
+
+  __ cmpl(FieldAddress(ARGS_DESC_REG,
+                       target::ArgumentsDescriptor::type_args_len_offset()),
+          Immediate(0));
+  __ j(NOT_EQUAL, &no_fcb_patch, Assembler::kNearJump);
+
+  __ movl(EBX, FieldAddress(ARGS_DESC_REG,
+                            target::ArgumentsDescriptor::count_offset()));
+  __ cmpl(EBX, FieldAddress(
+                   ARGS_DESC_REG,
+                   target::ArgumentsDescriptor::positional_count_offset()));
+  __ j(NOT_EQUAL, &no_fcb_patch, Assembler::kNearJump);
+
+  __ movl(EDI, raw_null);
+  __ movl(ESI, raw_null);
+  __ movl(EDX, raw_null);
+  __ cmpl(EBX, Immediate(target::ToRawSmi(0)));
+  __ j(EQUAL, &fcb_count_zero, Assembler::kNearJump);
+  __ cmpl(EBX, Immediate(target::ToRawSmi(3)));
+  __ j(GREATER, &no_fcb_patch, Assembler::kNearJump);
+  __ movl(EDI, Address(ESP, EBX, TIMES_2, 0));  // Argument 0.
+  __ cmpl(EBX, Immediate(target::ToRawSmi(1)));
+  __ j(EQUAL, &fcb_count_one, Assembler::kNearJump);
+  __ movl(ESI, Address(ESP, EBX, TIMES_2, -target::kWordSize));  // Arg 1.
+  __ cmpl(EBX, Immediate(target::ToRawSmi(2)));
+  __ j(EQUAL, &fcb_count_two, Assembler::kNearJump);
+  __ movl(EDX, Address(ESP, EBX, TIMES_2, -2 * target::kWordSize));  // Arg 2.
+  __ Bind(&fcb_count_two);
+  __ Bind(&fcb_count_one);
+  __ Bind(&fcb_count_zero);
+
+  __ EnterStubFrame();
+  __ pushl(ARGS_DESC_REG);  // Preserve arguments descriptor array.
+  __ pushl(Immediate(0));   // Result slot.
+  __ pushl(ARGS_DESC_REG);  // Arg0: arguments descriptor.
+  __ pushl(EDI);            // Arg1: argument 0 or null.
+  __ pushl(ESI);            // Arg2: argument 1 or null.
+  __ pushl(EDX);            // Arg3: argument 2 or null.
+  __ CallRuntime(kFcbPatchStaticCallAotRuntimeEntry, 4);
+  for (intptr_t i = 0; i < 4; ++i) {
+    __ popl(EAX);
+  }
+  __ popl(EAX);            // Patch result or Object::sentinel().
+  __ popl(ARGS_DESC_REG);  // Restore arguments descriptor array.
+  __ LeaveFrame();
+  __ CompareObject(EAX, SentinelObject());
+  __ j(EQUAL, &no_fcb_patch, Assembler::kNearJump);
+  __ ret();
+
+  __ Bind(&no_fcb_patch);
   __ EnterStubFrame();
   __ pushl(ARGS_DESC_REG);  // Preserve arguments descriptor array.
   __ pushl(Immediate(0));   // Setup space on stack for return value.
@@ -526,6 +578,28 @@ void StubCodeCompiler::GenerateCallStaticFunctionStub() {
   __ LeaveFrame();
 
   __ jmp(FieldAddress(EAX, target::Code::entry_point_offset()));
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCallStub() {
+  // Phase D currently has a dedicated AOT resolver only for x64/arm64. Keep
+  // other targets buildable by using the stock static-call miss path.
+  GenerateCallStaticFunctionStub();
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall1Stub() {
+  GenerateFcbAotStaticCallStub();
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall2Stub() {
+  GenerateFcbAotStaticCallStub();
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall3Stub() {
+  GenerateFcbAotStaticCallStub();
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall4Stub() {
+  GenerateFcbAotStaticCallStub();
 }
 
 // Called from a static call only when an invalid code has been entered
@@ -1978,6 +2052,81 @@ static void EmitFastSmiOp(Assembler* assembler,
   __ ret();
 }
 
+static void GenerateFcbPatchStaticCallProbe(Assembler* assembler,
+                                            intptr_t argument_count) {
+  ASSERT(argument_count >= 0 && argument_count <= 3);
+
+  Label no_patch;
+  if (argument_count > 0) {
+    __ movl(EBX, FieldAddress(ARGS_DESC_REG,
+                              target::ArgumentsDescriptor::count_offset()));
+    __ movl(EDI, Address(ESP, EBX, TIMES_2, 0));  // Argument 0.
+  }
+  if (argument_count > 2) {
+    __ movl(ESI,
+            Address(ESP, EBX, TIMES_2, -2 * target::kWordSize));  // Arg 2.
+  }
+  if (argument_count > 1) {
+    __ movl(EBX, Address(ESP, EBX, TIMES_2, -target::kWordSize));  // Arg 1.
+  }
+
+  __ EnterStubFrame();
+  if (argument_count > 2) {
+    __ pushl(ESI);  // Preserve scratch register used for argument 2.
+  }
+  __ pushl(ECX);            // Preserve ICData.
+  __ pushl(ARGS_DESC_REG);  // Preserve arguments descriptor array.
+  __ pushl(FUNCTION_REG);   // Preserve target function.
+
+  __ pushl(Immediate(0));  // Result slot.
+  __ pushl(FUNCTION_REG);  // Arg0: target function.
+
+  if (argument_count > 0) {
+    __ pushl(EDI);  // Arg1: argument 0.
+  }
+  if (argument_count > 1) {
+    __ pushl(EBX);  // Arg2: argument 1.
+  }
+  if (argument_count > 2) {
+    __ pushl(ESI);  // Arg3: argument 2.
+  }
+
+  switch (argument_count) {
+    case 0:
+      __ CallRuntime(kFcbPatchCall0RuntimeEntry, 1);
+      break;
+    case 1:
+      __ CallRuntime(kFcbPatchCall1RuntimeEntry, 2);
+      break;
+    case 2:
+      __ CallRuntime(kFcbPatchCall2RuntimeEntry, 3);
+      break;
+    case 3:
+      __ CallRuntime(kFcbPatchCall3RuntimeEntry, 4);
+      break;
+    default:
+      UNREACHABLE();
+  }
+
+  for (intptr_t i = 0; i < argument_count + 1; ++i) {
+    __ popl(EAX);
+  }
+  __ popl(EBX);  // Patch result or Object::sentinel().
+  __ CompareObject(EBX, SentinelObject());
+  __ popl(FUNCTION_REG);
+  __ popl(ARGS_DESC_REG);
+  __ popl(ECX);
+  if (argument_count > 2) {
+    __ popl(ESI);
+  }
+  __ LeaveFrame();
+  __ j(EQUAL, &no_patch, Assembler::kNearJump);
+  __ movl(EAX, EBX);
+  __ ret();
+
+  __ Bind(&no_patch);
+}
+
 // Generate inline cache check for 'num_args'.
 //  EBX: receiver (if instance call)
 //  ECX: ICData
@@ -2205,6 +2354,10 @@ void StubCodeCompiler::GenerateNArgsCheckInlineCacheStubForEntryKind(
   __ Bind(&call_target_function);
   __ Comment("Call target");
   // EAX: Target function.
+  if (type == kStaticCall && kind == Token::kILLEGAL &&
+      optimized == kUnoptimized && num_args <= 3) {
+    GenerateFcbPatchStaticCallProbe(assembler, num_args);
+  }
   __ jmp(FieldAddress(FUNCTION_REG,
                       target::Function::entry_point_offset(entry_kind)));
 
@@ -2382,6 +2535,7 @@ static void GenerateZeroArgsUnoptimizedStaticCallForEntryKind(
 
   // Get function and call it, if possible.
   __ movl(FUNCTION_REG, Address(EBX, target_offset));
+  GenerateFcbPatchStaticCallProbe(assembler, 0);
   __ jmp(FieldAddress(FUNCTION_REG,
                       target::Function::entry_point_offset(entry_kind)));
 
@@ -2407,9 +2561,9 @@ void StubCodeCompiler::GenerateZeroArgsUnoptimizedStaticCallStub() {
 // ECX: ICData
 // ESP[0]: return address
 void StubCodeCompiler::GenerateOneArgUnoptimizedStaticCallStub() {
-  GenerateNArgsCheckInlineCacheStub(
-      2, kStaticCallMissHandlerTwoArgsRuntimeEntry, Token::kILLEGAL,
-      kUnoptimized, kStaticCall, kIgnoreExactness);
+  GenerateNArgsCheckInlineCacheStub(1, kStaticCallMissHandlerOneArgRuntimeEntry,
+                                    Token::kILLEGAL, kUnoptimized, kStaticCall,
+                                    kIgnoreExactness);
 }
 
 // ECX: ICData

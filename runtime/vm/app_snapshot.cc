@@ -2661,6 +2661,7 @@ class CodeSerializationCluster : public SerializationCluster {
       s->Push(code->untag()->static_calls_target_table_);
       s->Push(code->untag()->compressed_stackmaps_);
     } else if (s->kind() == Snapshot::kFullAOT) {
+      s->Push(code->untag()->static_calls_target_table_);
       // Note: we don't trace compressed_stackmaps_ because we are going to emit
       // a separate mapping table into RO data which is not going to be a real
       // heap object.
@@ -2979,10 +2980,14 @@ class CodeSerializationCluster : public SerializationCluster {
     }
     if (FLAG_precompiled_mode && FLAG_dwarf_stack_traces_mode) {
       WriteFieldValue(inlined_id_to_function_, Array::null());
-      WriteFieldValue(code_source_map_, CodeSourceMap::null());
+      WriteFieldValue(code_source_map_,
+                      code->untag()->static_calls_target_table_);
     } else {
       WriteField(code, inlined_id_to_function_);
-      if (s->InCurrentLoadingUnitOrRoot(code->untag()->code_source_map_)) {
+      if (kind == Snapshot::kFullAOT) {
+        WriteFieldValue(code_source_map_,
+                        code->untag()->static_calls_target_table_);
+      } else if (s->InCurrentLoadingUnitOrRoot(code->untag()->code_source_map_)) {
         WriteField(code, code_source_map_);
       } else {
         WriteFieldValue(code_source_map_, CodeSourceMap::null());

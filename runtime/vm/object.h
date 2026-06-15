@@ -7169,8 +7169,7 @@ class Code : public Object {
   void set_static_calls_target_table(const Array& value) const;
   ArrayPtr static_calls_target_table() const {
 #if defined(DART_PRECOMPILED_RUNTIME)
-    UNREACHABLE();
-    return nullptr;
+    return static_cast<ArrayPtr>(untag()->code_source_map());
 #else
     return untag()->static_calls_target_table();
 #endif
@@ -7182,6 +7181,11 @@ class Code : public Object {
 
   // Returns null if there is no static call at 'pc'.
   FunctionPtr GetStaticCallTargetFunctionAt(uword pc) const;
+  // Returns null if there is no static call code target at 'pc'.
+  CodePtr GetStaticCallTargetCodeAt(uword pc) const;
+  // Returns 0 if there is no static call code target at 'pc'.
+  uword GetStaticCallTargetEntryPointAt(uword pc) const;
+  intptr_t GetStaticCallTargetEntryPointOffsetAt(uword pc) const;
   // Aborts if there is no static call at 'pc'.
   void SetStaticCallTargetCodeAt(uword pc, const Code& code) const;
   void SetStubCallTargetCodeAt(uword pc, const Code& code) const;
@@ -7535,7 +7539,8 @@ class Code : public Object {
     *PointerOffsetAddrAt(index) = offset_in_instructions;
   }
 
-  intptr_t BinarySearchInSCallTable(uword pc) const;
+  intptr_t BinarySearchInSCallTable(uword pc,
+                                    bool allow_return_pc = false) const;
   static CodePtr LookupCodeInIsolateGroup(IsolateGroup* isolate_group,
                                           uword pc);
 

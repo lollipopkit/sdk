@@ -61,6 +61,7 @@ class RuntimeEntry : public BaseRuntimeEntry {
   static constexpr const char* RuntimeEntryNames[] = {
 #define RUNTIME_ENTRY_NAME(name) #name,
       RUNTIME_ENTRY_LIST(RUNTIME_ENTRY_NAME)
+      FCB_RUNTIME_ENTRY_LIST(RUNTIME_ENTRY_NAME)
 #undef RUNTIME_ENTRY_NAME
   };
   static constexpr const char* LeafRuntimeEntryNames[] = {
@@ -90,6 +91,7 @@ class RuntimeEntry : public BaseRuntimeEntry {
 
 // Declare all runtime functions here.
 RUNTIME_ENTRY_LIST(DECLARE_RUNTIME_ENTRY)
+FCB_RUNTIME_ENTRY_LIST(DECLARE_RUNTIME_ENTRY)
 LEAF_RUNTIME_ENTRY_LIST(DECLARE_LEAF_RUNTIME_ENTRY)
 
 #undef DECLARE_RUNTIME_ENTRY

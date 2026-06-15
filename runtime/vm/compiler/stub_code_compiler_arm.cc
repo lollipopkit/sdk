@@ -587,6 +587,63 @@ void StubCodeCompiler::GenerateCallBootstrapNativeStub() {
 // Input parameters:
 //   ARGS_DESC_REG: arguments descriptor array.
 void StubCodeCompiler::GenerateCallStaticFunctionStub() {
+  Label no_fcb_patch, fcb_count_zero, fcb_count_one, fcb_count_two;
+
+  __ ldr(R8, FieldAddress(ARGS_DESC_REG,
+                          target::ArgumentsDescriptor::type_args_len_offset()));
+  __ CompareImmediate(R8, 0);
+  __ b(&no_fcb_patch, NE);
+
+  __ ldr(R8,
+         FieldAddress(ARGS_DESC_REG,
+                      target::ArgumentsDescriptor::count_offset()));
+  __ ldr(R9,
+         FieldAddress(ARGS_DESC_REG,
+                      target::ArgumentsDescriptor::positional_count_offset()));
+  __ cmp(R8, Operand(R9));
+  __ b(&no_fcb_patch, NE);
+
+  __ LoadObject(R1, NullObject());
+  __ LoadObject(R2, NullObject());
+  __ LoadObject(R5, NullObject());
+  __ SmiUntag(R8);
+  __ CompareImmediate(R8, 0);
+  __ b(&fcb_count_zero, EQ);
+  __ CompareImmediate(R8, 3);
+  __ b(&no_fcb_patch, GT);
+  __ sub(R9, R8, Operand(1));
+  __ ldr(R1, Address(SP, R9, LSL, target::kWordSizeLog2));  // Argument 0.
+  __ CompareImmediate(R8, 1);
+  __ b(&fcb_count_one, EQ);
+  __ sub(R9, R8, Operand(2));
+  __ ldr(R2, Address(SP, R9, LSL, target::kWordSizeLog2));  // Argument 1.
+  __ CompareImmediate(R8, 2);
+  __ b(&fcb_count_two, EQ);
+  __ sub(R9, R8, Operand(3));
+  __ ldr(R5, Address(SP, R9, LSL, target::kWordSizeLog2));  // Argument 2.
+  __ Bind(&fcb_count_two);
+  __ Bind(&fcb_count_one);
+  __ Bind(&fcb_count_zero);
+
+  __ EnterStubFrame();
+  __ Push(ARGS_DESC_REG);  // Preserve arguments descriptor array.
+  __ LoadImmediate(IP, 0);
+  __ Push(IP);             // Result slot.
+  __ Push(ARGS_DESC_REG);  // Arg0: arguments descriptor.
+  __ Push(R1);             // Arg1: argument 0 or null.
+  __ Push(R2);             // Arg2: argument 1 or null.
+  __ Push(R5);             // Arg3: argument 2 or null.
+  __ CallRuntime(kFcbPatchStaticCallAotRuntimeEntry, 4);
+  __ Drop(4);
+  __ Pop(R0);             // Patch result or Object::sentinel().
+  __ Pop(ARGS_DESC_REG);  // Restore arguments descriptor array.
+  __ RestoreCodePointer();
+  __ LeaveStubFrame();
+  __ CompareObject(R0, SentinelObject());
+  __ b(&no_fcb_patch, EQ);
+  __ Ret();
+
+  __ Bind(&no_fcb_patch);
   // Create a stub frame as we are pushing some objects on the stack before
   // calling into the runtime.
   __ EnterStubFrame();
@@ -601,6 +658,28 @@ void StubCodeCompiler::GenerateCallStaticFunctionStub() {
   // Jump to the dart function.
   __ mov(CODE_REG, Operand(R0));
   __ Branch(FieldAddress(R0, target::Code::entry_point_offset()));
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCallStub() {
+  // Phase D currently has a dedicated AOT resolver only for x64/arm64. Keep
+  // other targets buildable by using the stock static-call miss path.
+  GenerateCallStaticFunctionStub();
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall1Stub() {
+  GenerateFcbAotStaticCallStub();
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall2Stub() {
+  GenerateFcbAotStaticCallStub();
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall3Stub() {
+  GenerateFcbAotStaticCallStub();
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall4Stub() {
+  GenerateFcbAotStaticCallStub();
 }
 
 // Called from a static call only when an invalid code has been entered
@@ -2226,6 +2305,79 @@ static void GenerateRecordEntryPoint(Assembler* assembler) {
   __ Bind(&done);
 }
 
+static void GenerateFcbPatchStaticCallProbe(Assembler* assembler,
+                                            intptr_t argument_count) {
+  ASSERT(argument_count >= 0 && argument_count <= 3);
+
+  Label no_patch;
+  if (argument_count > 0) {
+    __ ldr(R8, FieldAddress(ARGS_DESC_REG,
+                            target::ArgumentsDescriptor::count_offset()));
+    __ sub(R8, R8, Operand(target::ToRawSmi(1)));
+    __ ldr(R1, Address(SP, R8, LSL, 1));  // R8 (argument_count - 1) is Smi.
+  }
+  if (argument_count > 1) {
+    __ sub(R8, R8, Operand(target::ToRawSmi(1)));
+    __ ldr(R2, Address(SP, R8, LSL, 1));  // R8 (argument_count - 2) is Smi.
+  }
+  if (argument_count > 2) {
+    __ sub(R8, R8, Operand(target::ToRawSmi(1)));
+    __ ldr(R5, Address(SP, R8, LSL, 1));  // R8 (argument_count - 3) is Smi.
+  }
+
+  __ EnterStubFrame();
+  __ Push(R9);             // Preserve ICData.
+  __ Push(ARGS_DESC_REG);  // Preserve arguments descriptor array.
+  __ Push(FUNCTION_REG);   // Preserve target function.
+  __ Push(R3);             // Preserve selected entry-point offset.
+
+  __ LoadImmediate(IP, 0);
+  __ Push(IP);            // Result slot.
+  __ Push(FUNCTION_REG);  // Arg0: target function.
+
+  if (argument_count > 0) {
+    __ Push(R1);  // Arg1: argument 0.
+  }
+  if (argument_count > 1) {
+    __ Push(R2);  // Arg2: argument 1.
+  }
+  if (argument_count > 2) {
+    __ Push(R5);  // Arg3: argument 2.
+  }
+
+  switch (argument_count) {
+    case 0:
+      __ CallRuntime(kFcbPatchCall0RuntimeEntry, 1);
+      break;
+    case 1:
+      __ CallRuntime(kFcbPatchCall1RuntimeEntry, 2);
+      break;
+    case 2:
+      __ CallRuntime(kFcbPatchCall2RuntimeEntry, 3);
+      break;
+    case 3:
+      __ CallRuntime(kFcbPatchCall3RuntimeEntry, 4);
+      break;
+    default:
+      UNREACHABLE();
+  }
+
+  __ Drop(argument_count + 1);
+  __ Pop(R1);  // Patch result or Object::sentinel().
+  __ CompareObject(R1, SentinelObject());
+  __ Pop(R3);
+  __ Pop(FUNCTION_REG);
+  __ Pop(ARGS_DESC_REG);
+  __ Pop(R9);
+  __ RestoreCodePointer();
+  __ LeaveStubFrame();
+  __ b(&no_patch, EQ);
+  __ mov(R0, Operand(R1));
+  __ Ret();
+
+  __ Bind(&no_patch);
+}
+
 // Generate inline cache check for 'num_args'.
 //  R0: receiver (if instance call)
 //  R9: ICData
@@ -2472,6 +2624,10 @@ void StubCodeCompiler::GenerateNArgsCheckInlineCacheStub(
   __ Comment("Call target");
   __ Bind(&call_target_function);
   // R0: target function.
+  if (type == kStaticCall && kind == Token::kILLEGAL &&
+      optimized == kUnoptimized && num_args <= 3) {
+    GenerateFcbPatchStaticCallProbe(assembler, num_args);
+  }
   __ ldr(CODE_REG, FieldAddress(FUNCTION_REG, target::Function::code_offset()));
 
   if (save_entry_point) {
@@ -2662,6 +2818,7 @@ void StubCodeCompiler::GenerateZeroArgsUnoptimizedStaticCallStub() {
 
   // Get function and call it, if possible.
   __ LoadFromOffset(FUNCTION_REG, R8, target_offset);
+  GenerateFcbPatchStaticCallProbe(assembler, 0);
   __ ldr(CODE_REG, FieldAddress(FUNCTION_REG, target::Function::code_offset()));
 
   __ Branch(Address(FUNCTION_REG, R3));

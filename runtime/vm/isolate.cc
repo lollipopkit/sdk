@@ -1150,6 +1150,33 @@ void IsolateGroup::set_object_store(ObjectStore* object_store) {
   object_store_.reset(object_store);
 }
 
+bool IsolateGroup::LoadFcbPatchRuntimeFromFile(const char* path,
+                                               std::string* error) {
+  if (path == nullptr || path[0] == '\0') {
+    if (error != nullptr) {
+      *error = "FCB bytecode patch path is empty";
+    }
+    return false;
+  }
+  std::unique_ptr<fcb::PatchRuntime> next(new fcb::PatchRuntime());
+  if (!next->LoadModuleFromFile(path, error)) {
+    return false;
+  }
+  fcb_patch_runtime_ = std::move(next);
+  return true;
+}
+
+fcb::PatchRuntime* IsolateGroup::EnsureFcbPatchRuntime() {
+  if (fcb_patch_runtime_ == nullptr) {
+    fcb_patch_runtime_.reset(new fcb::PatchRuntime());
+  }
+  return fcb_patch_runtime_.get();
+}
+
+void IsolateGroup::ClearFcbPatchRuntime() {
+  fcb_patch_runtime_.reset();
+}
+
 class IsolateMessageHandler : public MessageHandler {
  public:
   explicit IsolateMessageHandler(Isolate* isolate);

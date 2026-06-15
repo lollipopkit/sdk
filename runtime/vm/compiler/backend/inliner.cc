@@ -18,6 +18,7 @@
 #include "vm/compiler/frontend/kernel_to_il.h"
 #include "vm/compiler/jit/compiler.h"
 #include "vm/compiler/jit/jit_call_specializer.h"
+#include "vm/fcb_patch_entry.h"
 #include "vm/compiler/method_recognizer.h"
 #include "vm/flags.h"
 #include "vm/kernel.h"
@@ -25,6 +26,7 @@
 #include "vm/longjump.h"
 #include "vm/object.h"
 #include "vm/object_store.h"
+#include "vm/thread.h"
 
 namespace dart {
 
@@ -610,6 +612,15 @@ class CallSites : public ValueObject {
                         intptr_t nesting_depth,
                         GrowableArray<InlinedInfo>* inlined_info) {
     const Function& function = static_call->function();
+    if (fcb::IsFunctionPatched(Thread::Current(), function)) {
+      if (inlined_info != nullptr && FLAG_print_inlining_tree) {
+        const Function* caller = &graph->function();
+        const Function* target = &static_call->function();
+        inlined_info->Add(InlinedInfo(caller, target, depth + 1, static_call,
+                                      "FCB patched"));
+      }
+      return false;
+    }
     if (!inline_only_profitable_methods || function.IsRecognized() ||
         function.IsDispatcherOrImplicitAccessor() ||
         function.IsMethodExtractor() ||
@@ -1722,6 +1733,11 @@ class CallSiteInliner : public ValueObject {
     for (intptr_t call_idx = 0; call_idx < call_info.length(); ++call_idx) {
       StaticCallInstr* call = call_info[call_idx].call;
       const Function& target = call->function();
+      if (fcb::IsFunctionPatched(Thread::Current(), target)) {
+        PRINT_INLINING_TREE("FCB patched", &call_info[call_idx].caller(),
+                            &call->function(), call);
+        continue;
+      }
       if (!inliner_->AlwaysInline(target) &&
           (call_info[call_idx].ratio * 100) < FLAG_inlining_hotness) {
         if (trace_inlining()) {

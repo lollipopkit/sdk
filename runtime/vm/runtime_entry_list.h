@@ -92,6 +92,15 @@ namespace dart {
   V(FatalError)                                                                \
   V(EnsureDeeplyImmutable)
 
+#define FCB_RUNTIME_ENTRY_LIST(V)                                              \
+  V(FcbPatchCall0)                                                             \
+  V(FcbPatchCall1)                                                             \
+  V(FcbPatchCall2)                                                             \
+  V(FcbPatchCall3)                                                             \
+  V(FcbPatchStaticCallAot)                                                     \
+  V(FcbPatchStaticCallAot4)                                                    \
+  V(FcbResolveStaticCallAot)
+
 // Note: Leaf runtime function have C linkage, so they cannot pass C++ struct
 // values like ObjectPtr.
 

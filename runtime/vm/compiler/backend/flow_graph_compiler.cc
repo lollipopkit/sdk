@@ -20,6 +20,7 @@
 #include "vm/debugger.h"
 #include "vm/deopt_instructions.h"
 #include "vm/exceptions.h"
+#include "vm/fcb_patch_entry.h"
 #include "vm/flags.h"
 #include "vm/kernel_isolate.h"
 #include "vm/log.h"
@@ -33,6 +34,7 @@
 #include "vm/stack_frame.h"
 #include "vm/stub_code.h"
 #include "vm/symbols.h"
+#include "vm/thread.h"
 #include "vm/timeline.h"
 #include "vm/type_testing_stubs.h"
 
@@ -62,6 +64,10 @@ DEFINE_FLAG(bool,
             force_indirect_calls,
             false,
             "Do not emit PC relative calls.");
+DEFINE_FLAG(bool,
+            fcb_enable_aot_dispatch,
+            true,
+            "Keep AOT static calls in a form that can be intercepted by FCB.");
 
 DECLARE_FLAG(charp, deoptimize_filter);
 DECLARE_FLAG(bool, intrinsify);
@@ -3534,12 +3540,14 @@ void FlowGraphCompiler::EmitMoveConst(const compiler::ffi::NativeLocation& dst,
 
 bool FlowGraphCompiler::CanPcRelativeCall(const Function& target) const {
   return FLAG_precompiled_mode && !FLAG_force_indirect_calls &&
+         !FLAG_fcb_enable_aot_dispatch &&
          (LoadingUnit::LoadingUnitOf(function()) ==
           LoadingUnit::LoadingUnitOf(target));
 }
 
 bool FlowGraphCompiler::CanPcRelativeCall(const Code& target) const {
   return FLAG_precompiled_mode && !FLAG_force_indirect_calls &&
+         !FLAG_fcb_enable_aot_dispatch &&
          !target.InVMIsolateHeap() &&
          (LoadingUnit::LoadingUnitOf(function()) ==
           LoadingUnit::LoadingUnitOf(target));
@@ -3547,6 +3555,7 @@ bool FlowGraphCompiler::CanPcRelativeCall(const Code& target) const {
 
 bool FlowGraphCompiler::CanPcRelativeCall(const AbstractType& target) const {
   return FLAG_precompiled_mode && !FLAG_force_indirect_calls &&
+         !FLAG_fcb_enable_aot_dispatch &&
          !target.InVMIsolateHeap() &&
          (LoadingUnit::LoadingUnitOf(function()) ==
           LoadingUnit::LoadingUnit::kRootId);

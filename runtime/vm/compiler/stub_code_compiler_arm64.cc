@@ -842,6 +842,129 @@ void StubCodeCompiler::GenerateCallStaticFunctionStub() {
   __ br(R0);
 }
 
+static void GenerateFcbAotStaticCallStubForArity(Assembler* assembler,
+                                                 intptr_t argument_count) {
+  ASSERT(argument_count >= 0 && argument_count <= 4);
+  Label return_patch_result, return_unboxed_int64_result, jump_to_original;
+
+  if (argument_count > 0) {
+    __ ldr(R9, Address(SP, (argument_count - 1) * target::kWordSize));
+  } else {
+    __ LoadObject(R9, NullObject());
+  }
+  if (argument_count > 1) {
+    __ ldr(R10, Address(SP, (argument_count - 2) * target::kWordSize));
+  } else {
+    __ LoadObject(R10, NullObject());
+  }
+  if (argument_count > 2) {
+    __ ldr(R11, Address(SP, (argument_count - 3) * target::kWordSize));
+  } else {
+    __ LoadObject(R11, NullObject());
+  }
+  if (argument_count > 3) {
+    __ ldr(R12, Address(SP, (argument_count - 4) * target::kWordSize));
+  } else {
+    __ LoadObject(R12, NullObject());
+  }
+
+  __ EnterStubFrame();
+  __ Push(ARGS_DESC_REG);  // Preserve even when it is not a descriptor.
+  __ Push(R0);             // Preserve original argument/return register.
+  __ Push(R1);             // Preserve original argument register 1.
+  __ Push(R2);             // Preserve original argument register 2.
+  __ Push(R3);             // Preserve original argument register 3.
+  __ Push(R5);             // Preserve original argument register 4.
+  __ Push(R6);             // Preserve original argument register 5.
+  __ Push(R7);             // Preserve original argument register 6.
+  __ Push(ZR);             // Result slot.
+  if (argument_count == 0) {
+    __ LoadObject(R0, NullObject());
+  } else {
+    __ LoadImmediate(R0, target::ToRawSmi(argument_count));
+  }
+  __ Push(R0);  // Arg0: descriptor-less arity sentinel.
+  __ Push(R9);   // Arg1: argument 0 or null.
+  __ Push(R10);  // Arg2: argument 1 or null.
+  __ Push(R11);  // Arg3: argument 2 or null.
+  if (argument_count > 3) {
+    __ Push(R12);  // Arg4: argument 3.
+    __ CallRuntime(kFcbPatchStaticCallAot4RuntimeEntry, 5);
+    __ RestorePinnedRegisters();
+    __ Drop(5);
+  } else {
+    __ CallRuntime(kFcbPatchStaticCallAotRuntimeEntry, 4);
+    __ RestorePinnedRegisters();
+    __ Drop(4);
+  }
+  __ Pop(R9);             // Patch result, target Code, or Object::sentinel().
+  __ Pop(R7);             // Restore saved argument 6.
+  __ Pop(R6);             // Restore saved argument 5.
+  __ Pop(R5);             // Restore saved argument 4.
+  __ Pop(R3);             // Restore saved argument 2 or null.
+  __ Pop(R2);             // Restore saved argument 1 or null.
+  __ Pop(R1);             // Restore saved argument 0 or null.
+  __ Pop(R0);             // Restore original argument/return register.
+  __ Pop(ARGS_DESC_REG);  // Restore arguments descriptor array.
+  __ RestoreCodePointer();
+  __ LeaveStubFrame();
+
+  __ BranchIfSmi(R9, &return_unboxed_int64_result);
+  __ CompareClassId(R9, kCodeCid);
+  __ b(&jump_to_original, EQ);
+  __ LoadClassId(R8, R9);
+  __ CompareImmediate(R8, kArrayCid);
+  __ b(&return_patch_result, LT);
+  __ CompareImmediate(R8, kImmutableArrayCid);
+  __ b(&return_patch_result, GT);
+
+  // Patch hits return [return_convention, value]. Convention 1 is the current
+  // Phase D unboxed-int64 AOT smoke ABI; convention 0 is a normal tagged value.
+  __ AddImmediate(R8, R9, target::Array::data_offset() - kHeapObjectTag);
+  __ LoadCompressed(R7, Address(R8));
+  __ LoadCompressed(R9, Address(R8, target::kCompressedWordSize));
+  __ CompareImmediate(R7, target::ToRawSmi(1));
+  __ b(&return_unboxed_int64_result, EQ);
+
+  __ Bind(&return_patch_result);
+  __ mov(R0, R9);
+  __ ret();
+
+  __ Bind(&return_unboxed_int64_result);
+  __ mov(R0, R9);
+  __ BranchIfNotSmi(R0, &return_patch_result);
+  __ SmiUntag(R0);
+  __ ret();
+
+  __ Bind(&jump_to_original);
+  __ LoadFieldFromOffset(R9, R9, target::Code::entry_point_offset());
+  __ br(R9);
+}
+
+// AOT-safe FCB static-call trampolines.
+//
+// The callsite return address remains the Dart caller's static-call PC, so the
+// runtime entries can look up the original Function from the static-call table.
+void StubCodeCompiler::GenerateFcbAotStaticCallStub() {
+  GenerateFcbAotStaticCallStubForArity(assembler, 0);
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall1Stub() {
+  GenerateFcbAotStaticCallStubForArity(assembler, 1);
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall2Stub() {
+  GenerateFcbAotStaticCallStubForArity(assembler, 2);
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall3Stub() {
+  GenerateFcbAotStaticCallStubForArity(assembler, 3);
+}
+
+void StubCodeCompiler::GenerateFcbAotStaticCall4Stub() {
+  GenerateFcbAotStaticCallStubForArity(assembler, 4);
+}
+
 // Called from a static call only when an invalid code has been entered
 // (invalid because its function was optimized or deoptimized).
 // ARGS_DESC_REG: arguments descriptor array.
@@ -2614,6 +2737,79 @@ static void GenerateRecordEntryPoint(Assembler* assembler) {
   __ Bind(&done);
 }
 
+static void GenerateFcbPatchStaticCallProbe(Assembler* assembler,
+                                            intptr_t argument_count) {
+  ASSERT(argument_count >= 0 && argument_count <= 3);
+
+  Label no_patch;
+  if (argument_count > 0) {
+    __ LoadCompressedSmiFieldFromOffset(
+        R6, ARGS_DESC_REG, target::ArgumentsDescriptor::count_offset());
+    __ SmiUntag(R6);
+    __ sub(R6, R6, Operand(1));
+    __ ldr(R1, Address(SP, R6, UXTX, Address::Scaled));  // Argument 0.
+  }
+  if (argument_count > 1) {
+    __ sub(R6, R6, Operand(1));
+    __ ldr(R2, Address(SP, R6, UXTX, Address::Scaled));  // Argument 1.
+  }
+  if (argument_count > 2) {
+    __ sub(R6, R6, Operand(1));
+    __ ldr(R3, Address(SP, R6, UXTX, Address::Scaled));  // Argument 2.
+  }
+
+  __ EnterStubFrame();
+  __ Push(R5);             // Preserve ICData.
+  __ Push(ARGS_DESC_REG);  // Preserve arguments descriptor array.
+  __ Push(FUNCTION_REG);   // Preserve target function.
+  __ Push(R8);             // Preserve selected entry-point offset.
+
+  __ Push(ZR);            // Result slot.
+  __ Push(FUNCTION_REG);  // Arg0: target function.
+
+  if (argument_count > 0) {
+    __ Push(R1);  // Arg1: argument 0.
+  }
+  if (argument_count > 1) {
+    __ Push(R2);  // Arg2: argument 1.
+  }
+  if (argument_count > 2) {
+    __ Push(R3);  // Arg3: argument 2.
+  }
+
+  switch (argument_count) {
+    case 0:
+      __ CallRuntime(kFcbPatchCall0RuntimeEntry, 1);
+      break;
+    case 1:
+      __ CallRuntime(kFcbPatchCall1RuntimeEntry, 2);
+      break;
+    case 2:
+      __ CallRuntime(kFcbPatchCall2RuntimeEntry, 3);
+      break;
+    case 3:
+      __ CallRuntime(kFcbPatchCall3RuntimeEntry, 4);
+      break;
+    default:
+      UNREACHABLE();
+  }
+
+  __ Drop(argument_count + 1);
+  __ Pop(R1);  // Patch result or Object::sentinel().
+  __ CompareObject(R1, SentinelObject());
+  __ Pop(R8);
+  __ Pop(FUNCTION_REG);
+  __ Pop(ARGS_DESC_REG);
+  __ Pop(R5);
+  __ RestoreCodePointer();
+  __ LeaveStubFrame();
+  __ b(&no_patch, EQ);
+  __ mov(R0, R1);
+  __ ret();
+
+  __ Bind(&no_patch);
+}
+
 // Generate inline cache check for 'num_args'.
 //  R0: receiver (if instance call)
 //  R5: ICData
@@ -2873,6 +3069,10 @@ void StubCodeCompiler::GenerateNArgsCheckInlineCacheStub(
   __ Comment("Call target");
   __ Bind(&call_target_function);
   // R0: target function.
+  if (type == kStaticCall && kind == Token::kILLEGAL &&
+      optimized == kUnoptimized && num_args <= 3) {
+    GenerateFcbPatchStaticCallProbe(assembler, num_args);
+  }
   __ LoadCompressedFieldFromOffset(CODE_REG, FUNCTION_REG,
                                    target::Function::code_offset());
   if (save_entry_point) {
@@ -3071,6 +3271,7 @@ void StubCodeCompiler::GenerateZeroArgsUnoptimizedStaticCallStub() {
 
   // Get function and call it, if possible.
   __ LoadCompressedFromOffset(FUNCTION_REG, R6, target_offset);
+  GenerateFcbPatchStaticCallProbe(assembler, 0);
   __ LoadCompressedFieldFromOffset(CODE_REG, FUNCTION_REG,
                                    target::Function::code_offset());
   __ add(R2, FUNCTION_REG, Operand(R8));
