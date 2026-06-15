@@ -66,7 +66,7 @@ DEFINE_FLAG(bool,
             "Do not emit PC relative calls.");
 DEFINE_FLAG(bool,
             fcb_enable_aot_dispatch,
-            true,
+            false,
             "Keep AOT static calls in a form that can be intercepted by FCB.");
 
 DECLARE_FLAG(charp, deoptimize_filter);

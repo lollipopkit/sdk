@@ -851,131 +851,146 @@ void StubCodeCompiler::GenerateCallStaticFunctionStub() {
   __ jmp(RBX);
 }
 
-// AOT-safe FCB static-call trampoline.
-//
-// Input parameters:
-//   ARGS_DESC_REG: arguments descriptor array.
-//
-// The callsite return address remains the Dart caller's static-call PC, so the
-// runtime entries can look up the original Function from the static-call table.
-void StubCodeCompiler::GenerateFcbAotStaticCallStub() {
-  Label no_fcb_patch, fcb_count_zero, fcb_count_one, fcb_count_two,
-      resolve_failed;
+static void GenerateFcbAotStaticCallStubForArity(Assembler* assembler,
+                                                 intptr_t argument_count) {
+  ASSERT(argument_count >= 0 && argument_count <= 4);
+  Label return_patch_result, return_unboxed_int64_result, resolve_original,
+      jump_to_original;
 
   __ EnterStubFrame();
-  __ pushq(ARGS_DESC_REG);  // Preserve even when the register is not a
-                            // descriptor for precompiled direct calls.
+  __ pushq(ARGS_DESC_REG);  // Preserve even when it is not a descriptor.
+  __ pushq(RAX);            // Preserve original argument/return register.
+  __ pushq(RDI);            // Preserve Dart argument register 0.
+  __ pushq(RSI);            // Preserve Dart argument register 1.
+  __ pushq(RDX);            // Preserve Dart argument register 2.
+  __ pushq(RBX);            // Preserve Dart argument register 3.
+  __ pushq(R8);             // Preserve Dart argument register 4.
+  __ pushq(R9);             // Preserve Dart argument register 5.
   __ pushq(Immediate(0));   // Result slot.
-  __ PushObject(NullObject());  // Arg0: descriptor-less nullary sentinel.
-  __ PushObject(NullObject());  // Arg1 placeholder.
-  __ PushObject(NullObject());  // Arg2 placeholder.
-  __ PushObject(NullObject());  // Arg3 placeholder.
-  __ CallRuntime(kFcbPatchStaticCallAotRuntimeEntry, 4);
-  __ popq(RAX);            // Drop arg3.
-  __ popq(RAX);            // Drop arg2.
-  __ popq(RAX);            // Drop arg1.
-  __ popq(RAX);            // Drop arg0.
-  __ popq(RAX);            // Patch result or Object::sentinel().
+  if (argument_count == 0) {
+    __ PushObject(NullObject());  // Arg0: descriptor-less nullary sentinel.
+  } else {
+    __ pushq(Immediate(Smi::RawValue(argument_count)));
+  }
+  if (argument_count > 0) {
+    __ pushq(RDI);  // Arg1: argument 0.
+  } else {
+    __ PushObject(NullObject());
+  }
+  if (argument_count > 1) {
+    __ pushq(RSI);  // Arg2: argument 1.
+  } else {
+    __ PushObject(NullObject());
+  }
+  if (argument_count > 2) {
+    __ pushq(RDX);  // Arg3: argument 2.
+  } else {
+    __ PushObject(NullObject());
+  }
+  if (argument_count > 3) {
+    __ pushq(RBX);  // Arg4: argument 3.
+    __ CallRuntime(kFcbPatchStaticCallAot4RuntimeEntry, 5);
+    __ popq(R11);  // Drop arg4.
+  } else {
+    __ CallRuntime(kFcbPatchStaticCallAotRuntimeEntry, 4);
+  }
+  __ popq(R11);  // Drop arg3.
+  __ popq(R11);  // Drop arg2.
+  __ popq(R11);  // Drop arg1.
+  __ popq(R11);  // Drop arg0.
+  __ popq(RAX);  // Patch result, target Code, or Object::sentinel().
+  __ popq(R9);   // Restore Dart argument register 5.
+  __ popq(R8);   // Restore Dart argument register 4.
+  __ popq(RBX);  // Restore Dart argument register 3.
+  __ popq(RDX);  // Restore Dart argument register 2.
+  __ popq(RSI);  // Restore Dart argument register 1.
+  __ popq(RDI);  // Restore Dart argument register 0.
+  __ popq(R11);  // Saved original RAX; no longer needed unless this is a miss.
   __ popq(ARGS_DESC_REG);
   __ RestoreCodePointer();
   __ LeaveStubFrame();
+
+  __ BranchIfSmi(RAX, &return_unboxed_int64_result);
   __ CompareObject(RAX, SentinelObject());
-  __ j(EQUAL, &no_fcb_patch);
+  __ j(EQUAL, &resolve_original);
+  __ CompareClassId(RAX, kCodeCid);
+  __ j(EQUAL, &jump_to_original);
+  __ LoadClassId(RCX, RAX);
+  __ cmpq(RCX, Immediate(kArrayCid));
+  __ j(LESS, &return_patch_result);
+  __ cmpq(RCX, Immediate(kImmutableArrayCid));
+  __ j(GREATER, &return_patch_result);
+
+  // Patch hits can return [return_convention, value]. Convention 1 is the
+  // current Phase D unboxed-int64 AOT smoke ABI; convention 0 is tagged.
+  __ leaq(RCX, FieldAddress(RAX, target::Array::data_offset()));
+  __ LoadCompressed(RDX, Address(RCX, 0));
+  __ LoadCompressed(RAX, Address(RCX, target::kCompressedWordSize));
+  __ cmpq(RDX, Immediate(Smi::RawValue(1)));
+  __ j(EQUAL, &return_unboxed_int64_result);
+
+  __ Bind(&return_patch_result);
   __ ret();
 
-  __ OBJ(cmp)(FieldAddress(ARGS_DESC_REG,
-                           target::ArgumentsDescriptor::type_args_len_offset()),
-              Immediate(0));
-  __ j(NOT_EQUAL, &no_fcb_patch);
-
-  __ OBJ(mov)(R11, FieldAddress(ARGS_DESC_REG,
-                                target::ArgumentsDescriptor::count_offset()));
-  __ OBJ(cmp)(R11, FieldAddress(ARGS_DESC_REG,
-                                target::ArgumentsDescriptor::
-                                    positional_count_offset()));
-  __ j(NOT_EQUAL, &no_fcb_patch);
-
-  __ LoadObject(RCX, NullObject());
-  __ LoadObject(R9, NullObject());
-  __ LoadObject(RDI, NullObject());
-  __ SmiUntag(R11);
-  __ cmpq(R11, Immediate(0));
-  __ j(EQUAL, &fcb_count_zero);
-  __ cmpq(R11, Immediate(3));
-  __ j(GREATER, &no_fcb_patch);
-
-  __ OBJ(mov)(R11, FieldAddress(ARGS_DESC_REG,
-                                target::ArgumentsDescriptor::count_offset()));
-  __ leaq(R11, Address(RSP, R11, TIMES_4, 0));  // R11 is Smi.
-  __ movq(RCX, Address(R11, 0));                // Argument 0.
-  __ OBJ(cmp)(FieldAddress(ARGS_DESC_REG,
-                           target::ArgumentsDescriptor::count_offset()),
-              Immediate(Smi::RawValue(1)));
-  __ j(EQUAL, &fcb_count_one);
-  __ movq(R9, Address(R11, -target::kWordSize));  // Argument 1.
-  __ OBJ(cmp)(FieldAddress(ARGS_DESC_REG,
-                           target::ArgumentsDescriptor::count_offset()),
-              Immediate(Smi::RawValue(2)));
-  __ j(EQUAL, &fcb_count_two);
-  __ movq(RDI, Address(R11, -2 * target::kWordSize));  // Argument 2.
-  __ Bind(&fcb_count_two);
-  __ Bind(&fcb_count_one);
-  __ Bind(&fcb_count_zero);
-
-  __ EnterStubFrame();
-  __ pushq(ARGS_DESC_REG);  // Preserve arguments descriptor array.
-  __ pushq(Immediate(0));   // Result slot.
-  __ pushq(ARGS_DESC_REG);  // Arg0: arguments descriptor.
-  __ pushq(RCX);            // Arg1: argument 0 or null.
-  __ pushq(R9);             // Arg2: argument 1 or null.
-  __ pushq(RDI);            // Arg3: argument 2 or null.
-  __ CallRuntime(kFcbPatchStaticCallAotRuntimeEntry, 4);
-  __ popq(RAX);            // Drop arg3.
-  __ popq(RAX);            // Drop arg2.
-  __ popq(RAX);            // Drop arg1.
-  __ popq(RAX);            // Drop arg0.
-  __ popq(RAX);            // Patch result or Object::sentinel().
-  __ popq(ARGS_DESC_REG);  // Restore arguments descriptor array.
-  __ RestoreCodePointer();
-  __ LeaveStubFrame();
-  __ CompareObject(RAX, SentinelObject());
-  __ j(EQUAL, &no_fcb_patch);
+  __ Bind(&return_unboxed_int64_result);
+  __ BranchIfNotSmi(RAX, &return_patch_result);
+  __ SmiUntag(RAX);
   __ ret();
 
-  __ Bind(&no_fcb_patch);
+  __ Bind(&resolve_original);
+  __ pushq(RDI);
+  __ pushq(RSI);
+  __ pushq(RDX);
+  __ pushq(RBX);
+  __ pushq(R8);
+  __ pushq(R9);
   __ EnterStubFrame();
   __ pushq(ARGS_DESC_REG);  // Preserve arguments descriptor array.
   __ pushq(Immediate(0));   // Result slot.
   __ CallRuntime(kFcbResolveStaticCallAotRuntimeEntry, 0);
   __ popq(RAX);            // Target Code or Object::sentinel().
   __ popq(ARGS_DESC_REG);  // Restore arguments descriptor array.
+  __ RestoreCodePointer();
   __ LeaveStubFrame();
+  __ movq(R11, RAX);
+  __ popq(R9);
+  __ popq(R8);
+  __ popq(RBX);
+  __ popq(RDX);
+  __ popq(RSI);
+  __ popq(RDI);
+  __ movq(RAX, R11);
 
   __ CompareObject(RAX, SentinelObject());
-  __ j(EQUAL, &resolve_failed);
-  // Match the precompiled static-call sequence: keep CODE_REG untouched
-  // because callers may keep a live value there across AOT calls.
-  __ movq(RBX, FieldAddress(RAX, target::Code::entry_point_offset()));
-  __ jmp(RBX);
+  __ j(EQUAL, &return_patch_result);
 
-  __ Bind(&resolve_failed);
-  __ Stop("FCB AOT static-call target resolution failed");
+  __ Bind(&jump_to_original);
+  __ movq(TMP, FieldAddress(RAX, target::Code::entry_point_offset()));
+  __ jmp(TMP);
+}
+
+// AOT-safe FCB static-call trampolines.
+//
+// The callsite return address remains the Dart caller's static-call PC, so the
+// runtime entries can look up the original Function from the static-call table.
+void StubCodeCompiler::GenerateFcbAotStaticCallStub() {
+  GenerateFcbAotStaticCallStubForArity(assembler, 0);
 }
 
 void StubCodeCompiler::GenerateFcbAotStaticCall1Stub() {
-  GenerateFcbAotStaticCallStub();
+  GenerateFcbAotStaticCallStubForArity(assembler, 1);
 }
 
 void StubCodeCompiler::GenerateFcbAotStaticCall2Stub() {
-  GenerateFcbAotStaticCallStub();
+  GenerateFcbAotStaticCallStubForArity(assembler, 2);
 }
 
 void StubCodeCompiler::GenerateFcbAotStaticCall3Stub() {
-  GenerateFcbAotStaticCallStub();
+  GenerateFcbAotStaticCallStubForArity(assembler, 3);
 }
 
 void StubCodeCompiler::GenerateFcbAotStaticCall4Stub() {
-  GenerateFcbAotStaticCallStub();
+  GenerateFcbAotStaticCallStubForArity(assembler, 4);
 }
 
 // Called from a static call only when an invalid code has been entered

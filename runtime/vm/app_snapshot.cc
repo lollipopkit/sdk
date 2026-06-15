@@ -42,6 +42,8 @@
 
 namespace dart {
 
+DECLARE_FLAG(bool, fcb_enable_aot_dispatch);
+
 #if !defined(DART_PRECOMPILED_RUNTIME)
 DEFINE_FLAG(bool,
             print_cluster_information,
@@ -2980,11 +2982,15 @@ class CodeSerializationCluster : public SerializationCluster {
     }
     if (FLAG_precompiled_mode && FLAG_dwarf_stack_traces_mode) {
       WriteFieldValue(inlined_id_to_function_, Array::null());
-      WriteFieldValue(code_source_map_,
-                      code->untag()->static_calls_target_table_);
+      if (kind == Snapshot::kFullAOT && FLAG_fcb_enable_aot_dispatch) {
+        WriteFieldValue(code_source_map_,
+                        code->untag()->static_calls_target_table_);
+      } else {
+        WriteFieldValue(code_source_map_, CodeSourceMap::null());
+      }
     } else {
       WriteField(code, inlined_id_to_function_);
-      if (kind == Snapshot::kFullAOT) {
+      if (kind == Snapshot::kFullAOT && FLAG_fcb_enable_aot_dispatch) {
         WriteFieldValue(code_source_map_,
                         code->untag()->static_calls_target_table_);
       } else if (s->InCurrentLoadingUnitOrRoot(code->untag()->code_source_map_)) {
