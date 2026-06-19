@@ -68,6 +68,12 @@ bool TryInvokePatchedFunction(Thread* thread,
                               const Array& arguments,
                               ObjectPtr* out_result);
 
+bool TryInvokeBytecodeClosureTrampoline(Thread* thread,
+                                        const Function& function,
+                                        const Array& arguments,
+                                        const Array& arguments_descriptor,
+                                        ObjectPtr* out_result);
+
 bool TryInvokePatchedFunction(Thread* thread,
                               const Function& function,
                               const std::vector<ObjectPtr>& arguments,

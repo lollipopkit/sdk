@@ -6,6 +6,7 @@
 #include "vm/bootstrap_natives.h"
 #include "vm/debugger.h"
 #include "vm/exceptions.h"
+#include "vm/fcb_patch_runtime_internal.h"
 #include "vm/native_entry.h"
 #include "vm/object_store.h"
 #include "vm/runtime_entry.h"
@@ -34,6 +35,24 @@ static StackTracePtr CreateStackTraceObject(
   return StackTrace::New(code_array, pc_offset_array);
 }
 
+static void AppendFcbPatchFrames(const GrowableObjectArray& code_list,
+                                 GrowableArray<uword>* pc_offset_list) {
+  const std::size_t count = fcb::internal::PatchStackTraceLocationCount();
+  if (count == 0) {
+    return;
+  }
+  for (std::size_t i = 0; i < count; i++) {
+    const char* location = fcb::internal::PatchStackTraceLocationAt(i);
+    if (location == nullptr) {
+      continue;
+    }
+    code_list.Add(String::Handle(Thread::Current()->zone(),
+                                 String::New(location)));
+    pc_offset_list->Add(0);
+  }
+  fcb::internal::ClearPatchStackTraceLocation();
+}
+
 // Gets current stack trace for `thread`.
 static StackTracePtr CurrentStackTrace(Thread* thread,
                                        intptr_t skip_frames = 1) {
@@ -53,6 +72,7 @@ static StackTracePtr CurrentStackTrace(Thread* thread,
                                    }
                                    pc_offset_array.Add(frame.pc_offset);
                                  });
+  AppendFcbPatchFrames(code_array, &pc_offset_array);
 
   return CreateStackTraceObject(zone, code_array, pc_offset_array);
 }
@@ -112,6 +132,7 @@ const StackTrace& GetCurrentStackTrace(int skip_frames) {
       GrowableObjectArray::Handle(zone, GrowableObjectArray::New());
   GrowableArray<uword> pc_offset_list;
   AppendFrames(code_list, &pc_offset_list, skip_frames);
+  AppendFcbPatchFrames(code_list, &pc_offset_list);
 
   const StackTrace& stacktrace = StackTrace::Handle(
       zone, CreateStackTraceObject(zone, code_list, pc_offset_list));

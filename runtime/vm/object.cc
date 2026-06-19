@@ -38,6 +38,7 @@
 #include "vm/double_conversion.h"
 #include "vm/elf.h"
 #include "vm/exceptions.h"
+#include "vm/fcb_patch_runtime_internal.h"
 #include "vm/growable_array.h"
 #include "vm/hash.h"
 #include "vm/hash_table.h"
@@ -27291,6 +27292,15 @@ const char* StackTrace::ToCString() const {
         continue;
       }
 
+      if (code_object.IsString()) {
+        in_gap = false;
+        PrintSymbolicStackFrameIndex(&buffer, frame_index);
+        buffer.Printf(" <fcb patch> (%s FCB patch)\n",
+                      String::Cast(code_object).ToCString());
+        frame_index++;
+        continue;
+      }
+
       const uword pc_offset = stack_trace.PcOffsetAtFrame(i);
 
       // A visible frame ends any gap we might be in.
@@ -27415,6 +27425,24 @@ const char* StackTrace::ToCString() const {
     }
   }
 #endif
+
+  const std::size_t fcb_patch_location_count =
+      fcb::internal::PatchStackTraceLocationCount();
+  if (fcb_patch_location_count > 0) {
+    if (frame_index > 0) {
+      buffer.AddString("\n");
+    }
+    for (std::size_t i = 0; i < fcb_patch_location_count; i++) {
+      const char* fcb_patch_location =
+          fcb::internal::PatchStackTraceLocationAt(i);
+      if (fcb_patch_location != nullptr) {
+        buffer.Printf("#%-6" Pd " <fcb patch> (%s FCB patch)\n", frame_index,
+                      fcb_patch_location);
+        frame_index++;
+      }
+    }
+    fcb::internal::ClearPatchStackTraceLocation();
+  }
 
   return buffer.buffer();
 }

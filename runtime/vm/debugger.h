@@ -291,6 +291,7 @@ class ActivationFrame : public ZoneObject {
     kRegular,
     kAsyncSuspensionMarker,
     kAsyncAwaiter,
+    kFcbPatch,
   };
 
   ActivationFrame(uword pc,
@@ -311,6 +312,24 @@ class ActivationFrame : public ZoneObject {
                   const Object& code_or_bytecode,
                   const Closure& closure);
 
+  explicit ActivationFrame(const String& fcb_patch_source_location);
+  ActivationFrame(const String& fcb_patch_source_location,
+                  const String& fcb_patch_function_id,
+                  intptr_t fcb_patch_bytecode_offset);
+  ActivationFrame(const String& fcb_patch_source_location,
+                  const String& fcb_patch_function_id,
+                  intptr_t fcb_patch_bytecode_offset,
+                  intptr_t fcb_patch_argument_count,
+                  intptr_t fcb_patch_captured_slot_count,
+                  intptr_t fcb_patch_active_handler_count,
+                  intptr_t fcb_patch_innermost_handler_offset,
+                  intptr_t fcb_patch_innermost_handler_end_offset,
+                  const Array& fcb_patch_local_names,
+                  const Array& fcb_patch_local_values,
+                  const Array& fcb_patch_value_materialized,
+                  const Array& fcb_patch_value_kinds,
+                  const Array& fcb_patch_value_previews);
+
   explicit ActivationFrame(Kind kind);
 
   Kind kind() const { return kind_; }
@@ -322,6 +341,46 @@ class ActivationFrame : public ZoneObject {
   // For |kAsyncAwaiter| frames this is the listener which will be invoked
   // when the frame below (callee) completes.
   const Closure& closure() const { return closure_; }
+
+  const String& fcb_patch_source_location() const {
+    ASSERT(kind_ == kFcbPatch);
+    return fcb_patch_source_location_;
+  }
+
+  const String& fcb_patch_function_id() const {
+    ASSERT(kind_ == kFcbPatch);
+    return fcb_patch_function_id_;
+  }
+
+  intptr_t fcb_patch_bytecode_offset() const {
+    ASSERT(kind_ == kFcbPatch);
+    return fcb_patch_bytecode_offset_;
+  }
+
+  intptr_t fcb_patch_captured_slot_count() const {
+    ASSERT(kind_ == kFcbPatch);
+    return fcb_patch_captured_slot_count_;
+  }
+
+  intptr_t fcb_patch_argument_count() const {
+    ASSERT(kind_ == kFcbPatch);
+    return fcb_patch_argument_count_;
+  }
+
+  intptr_t fcb_patch_active_handler_count() const {
+    ASSERT(kind_ == kFcbPatch);
+    return fcb_patch_active_handler_count_;
+  }
+
+  intptr_t fcb_patch_innermost_handler_offset() const {
+    ASSERT(kind_ == kFcbPatch);
+    return fcb_patch_innermost_handler_offset_;
+  }
+
+  intptr_t fcb_patch_innermost_handler_end_offset() const {
+    ASSERT(kind_ == kFcbPatch);
+    return fcb_patch_innermost_handler_end_offset_;
+  }
 
   const Function& function() const { return function_; }
 
@@ -341,6 +400,8 @@ class ActivationFrame : public ZoneObject {
   }
 
   bool IsInterpreted() const { return code_or_bytecode_.IsBytecode(); }
+
+  bool IsFcbPatchFrame() const { return kind_ == kFcbPatch; }
 
   enum Relation {
     kCallee,
@@ -414,6 +475,7 @@ class ActivationFrame : public ZoneObject {
   void PrintToJSONObjectRegular(JSONObject* jsobj);
   void PrintToJSONObjectAsyncAwaiter(JSONObject* jsobj);
   void PrintToJSONObjectAsyncSuspensionMarker(JSONObject* jsobj);
+  void PrintToJSONObjectFcbPatch(JSONObject* jsobj);
   void PrintContextMismatchError(intptr_t ctx_slot,
                                  intptr_t frame_ctx_level,
                                  intptr_t var_ctx_level);
@@ -434,6 +496,8 @@ class ActivationFrame : public ZoneObject {
         return "AsyncCausal";
       case kAsyncSuspensionMarker:
         return "AsyncSuspensionMarker";
+      case kFcbPatch:
+        return "FcbPatch";
       default:
         UNREACHABLE();
         return "";
@@ -455,6 +519,19 @@ class ActivationFrame : public ZoneObject {
   const Object& code_or_bytecode_;
   const Function& function_;
   const Closure& closure_;
+  const String& fcb_patch_source_location_;
+  const String& fcb_patch_function_id_;
+  const intptr_t fcb_patch_bytecode_offset_ = -1;
+  const intptr_t fcb_patch_argument_count_ = 0;
+  const intptr_t fcb_patch_captured_slot_count_ = 0;
+  const intptr_t fcb_patch_active_handler_count_ = 0;
+  const intptr_t fcb_patch_innermost_handler_offset_ = -1;
+  const intptr_t fcb_patch_innermost_handler_end_offset_ = -1;
+  const Array& fcb_patch_local_names_;
+  const Array& fcb_patch_local_values_;
+  const Array& fcb_patch_value_materialized_;
+  const Array& fcb_patch_value_kinds_;
+  const Array& fcb_patch_value_previews_;
 
   bool context_initialized_ = false;
   bool token_pos_initialized_ = false;
@@ -519,6 +596,7 @@ class DebuggerStackTrace : public ZoneObject {
   void AppendBytecodeFrame(StackFrame* frame,
                            const Function& function,
                            const Bytecode& bytecode);
+  void AppendFcbPatchFrames();
 
   Thread* thread_;
   Zone* zone_;

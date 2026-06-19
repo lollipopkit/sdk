@@ -845,25 +845,26 @@ void StubCodeCompiler::GenerateCallStaticFunctionStub() {
 static void GenerateFcbAotStaticCallStubForArity(Assembler* assembler,
                                                  intptr_t argument_count) {
   ASSERT(argument_count >= 0 && argument_count <= 4);
-  Label return_patch_result, return_unboxed_int64_result, jump_to_original;
+  Label return_patch_result, return_unboxed_int64_result, resolve_original,
+      jump_to_original;
 
   if (argument_count > 0) {
-    __ ldr(R9, Address(SP, (argument_count - 1) * target::kWordSize));
+    __ mov(R9, R1);
   } else {
     __ LoadObject(R9, NullObject());
   }
   if (argument_count > 1) {
-    __ ldr(R10, Address(SP, (argument_count - 2) * target::kWordSize));
+    __ mov(R10, R2);
   } else {
     __ LoadObject(R10, NullObject());
   }
   if (argument_count > 2) {
-    __ ldr(R11, Address(SP, (argument_count - 3) * target::kWordSize));
+    __ mov(R11, R3);
   } else {
     __ LoadObject(R11, NullObject());
   }
   if (argument_count > 3) {
-    __ ldr(R12, Address(SP, (argument_count - 4) * target::kWordSize));
+    __ mov(R12, R5);
   } else {
     __ LoadObject(R12, NullObject());
   }
@@ -910,6 +911,8 @@ static void GenerateFcbAotStaticCallStubForArity(Assembler* assembler,
   __ LeaveStubFrame();
 
   __ BranchIfSmi(R9, &return_unboxed_int64_result);
+  __ CompareObject(R9, SentinelObject());
+  __ b(&resolve_original, EQ);
   __ CompareClassId(R9, kCodeCid);
   __ b(&jump_to_original, EQ);
   __ LoadClassId(R8, R9);
@@ -921,7 +924,7 @@ static void GenerateFcbAotStaticCallStubForArity(Assembler* assembler,
   // Patch hits return [return_convention, value]. Convention 1 is the current
   // Phase D unboxed-int64 AOT smoke ABI; convention 0 is a normal tagged value.
   __ AddImmediate(R8, R9, target::Array::data_offset() - kHeapObjectTag);
-  __ LoadCompressed(R7, Address(R8));
+  __ LoadCompressedSmi(R7, Address(R8));
   __ LoadCompressed(R9, Address(R8, target::kCompressedWordSize));
   __ CompareImmediate(R7, target::ToRawSmi(1));
   __ b(&return_unboxed_int64_result, EQ);
@@ -935,6 +938,32 @@ static void GenerateFcbAotStaticCallStubForArity(Assembler* assembler,
   __ BranchIfNotSmi(R0, &return_patch_result);
   __ SmiUntag(R0);
   __ ret();
+
+  __ Bind(&resolve_original);
+  __ Push(R1);
+  __ Push(R2);
+  __ Push(R3);
+  __ Push(R5);
+  __ Push(R6);
+  __ Push(R7);
+  __ EnterStubFrame();
+  __ Push(ARGS_DESC_REG);  // Preserve arguments descriptor array.
+  __ Push(ZR);             // Result slot.
+  __ CallRuntime(kFcbResolveStaticCallAotRuntimeEntry, 0);
+  __ RestorePinnedRegisters();
+  __ Pop(R9);             // Target Code or Object::sentinel().
+  __ Pop(ARGS_DESC_REG);  // Restore arguments descriptor array.
+  __ RestoreCodePointer();
+  __ LeaveStubFrame();
+  __ Pop(R7);
+  __ Pop(R6);
+  __ Pop(R5);
+  __ Pop(R3);
+  __ Pop(R2);
+  __ Pop(R1);
+
+  __ CompareObject(R9, SentinelObject());
+  __ b(&return_patch_result, EQ);
 
   __ Bind(&jump_to_original);
   __ LoadFieldFromOffset(R9, R9, target::Code::entry_point_offset());

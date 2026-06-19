@@ -11,8 +11,43 @@
 #include "vm/isolate.h"
 #include "vm/object.h"
 #include "vm/os.h"
+#include "vm/fcb_patch_runtime_internal.h"
 #include "vm/symbols.h"
 #include "vm/thread.h"
+
+extern "C" {
+#if defined(__APPLE__)
+int __attribute__((weak)) fcb_current_patch_number() {
+  return -1;
+}
+int __attribute__((weak)) fcb_active_patch_number() {
+  return fcb_current_patch_number();
+}
+int __attribute__((weak)) fcb_report_interpret_failure(int patch_number,
+                                                       const char* function_id,
+                                                       const char* error) {
+  return -1;
+}
+void __attribute__((weak)) fcb_record_interpreter_call() {}
+void __attribute__((weak)) fcb_record_aot_call() {}
+#elif defined(__GNUC__)
+int fcb_current_patch_number() __attribute__((weak));
+int fcb_active_patch_number() __attribute__((weak));
+int fcb_report_interpret_failure(int patch_number,
+                                 const char* function_id,
+                                 const char* error) __attribute__((weak));
+void fcb_record_interpreter_call() __attribute__((weak));
+void fcb_record_aot_call() __attribute__((weak));
+#else
+int fcb_current_patch_number();
+int fcb_active_patch_number();
+int fcb_report_interpret_failure(int patch_number,
+                                 const char* function_id,
+                                 const char* error);
+void fcb_record_interpreter_call();
+void fcb_record_aot_call();
+#endif
+}
 
 namespace dart {
 
@@ -218,22 +253,27 @@ bool ObjectToValue(Thread* thread,
   }
   if (object.IsNull()) {
     *out_value = Value::Null();
+    out_value->object_value = object.ptr();
     return true;
   }
   if (object.IsInteger()) {
     *out_value = Value::Int(Integer::Cast(object).Value());
+    out_value->object_value = object.ptr();
     return true;
   }
   if (object.IsDouble()) {
     *out_value = Value::Double(Double::Cast(object).value());
+    out_value->object_value = object.ptr();
     return true;
   }
   if (object.IsBool()) {
     *out_value = Value::Bool(Bool::Cast(object).value());
+    out_value->object_value = object.ptr();
     return true;
   }
   if (object.IsString()) {
     *out_value = Value::String(String::Cast(object).ToCString());
+    out_value->object_value = object.ptr();
     return true;
   }
   if (object.IsArray()) {
@@ -251,6 +291,7 @@ bool ObjectToValue(Thread* thread,
       values.push_back(std::move(value));
     }
     *out_value = Value::List(std::move(values));
+    out_value->object_value = object.ptr();
     return true;
   }
   if (object.IsGrowableObjectArray()) {
@@ -268,6 +309,12 @@ bool ObjectToValue(Thread* thread,
       values.push_back(std::move(value));
     }
     *out_value = Value::List(std::move(values));
+    out_value->object_value = object.ptr();
+    return true;
+  }
+  if (object.IsInstance()) {
+    *out_value = Value::Null();
+    out_value->object_value = object.ptr();
     return true;
   }
   if (object.IsMap()) {
@@ -292,6 +339,7 @@ bool ObjectToValue(Thread* thread,
       entries.push_back(std::move(value));
     }
     *out_value = Value::Map(std::move(entries));
+    out_value->object_value = object.ptr();
     return true;
   }
   if (error != nullptr) {
@@ -361,6 +409,10 @@ bool ValueToObject(Thread* thread,
   if (out_object == nullptr) {
     return false;
   }
+  if (value.object_value != nullptr) {
+    *out_object = value.object_value;
+    return true;
+  }
   switch (value.kind) {
     case ValueKind::kNull:
       *out_object = Object::null();
@@ -394,6 +446,11 @@ bool ValueToObject(Thread* thread,
     }
     case ValueKind::kMap:
       return MapValueToObject(thread, value, out_object, error);
+    case ValueKind::kBytecodeClosure: {
+      Value mutable_value = value;
+      return internal::TryMaterializeDartObject(&mutable_value, out_object,
+                                                error);
+    }
   }
   UNREACHABLE();
   return false;
@@ -404,6 +461,48 @@ ErrorPtr ApiErrorFromMessage(const std::string& message) {
       String::Handle(String::New(("FCB patch interpreter failed: " + message)
                                      .c_str()));
   return ApiError::New(error);
+}
+
+void RecordInterpreterCall() {
+#if defined(__GNUC__)
+  if (fcb_record_interpreter_call == nullptr) {
+    return;
+  }
+#endif
+  fcb_record_interpreter_call();
+}
+
+void RecordAotCall() {
+#if defined(__GNUC__)
+  if (fcb_record_aot_call == nullptr) {
+    return;
+  }
+#endif
+  fcb_record_aot_call();
+}
+
+void ReportInterpretFailure(const std::string& function_id,
+                            const std::string& error) {
+#if defined(__GNUC__)
+  if (fcb_report_interpret_failure == nullptr) {
+    return;
+  }
+#endif
+  int patch_number = -1;
+#if defined(__GNUC__) && !defined(__APPLE__)
+  if (fcb_active_patch_number != nullptr) {
+    patch_number = fcb_active_patch_number();
+  } else if (fcb_current_patch_number != nullptr) {
+    patch_number = fcb_current_patch_number();
+  }
+#else
+  patch_number = fcb_active_patch_number();
+#endif
+  if (patch_number < 0) {
+    return;
+  }
+  fcb_report_interpret_failure(patch_number, function_id.c_str(),
+                               error.c_str());
 }
 
 DispatchDecision ResolveFunctionPatch(PatchRuntime* runtime,
@@ -523,6 +622,7 @@ bool TryInvokePatchedFunctionImpl(Thread* thread,
                    function.ToFullyQualifiedCString(), function_id.c_str(),
                    static_cast<int>(decision.state));
     }
+    RecordAotCall();
     return false;
   }
 
@@ -534,6 +634,7 @@ bool TryInvokePatchedFunctionImpl(Thread* thread,
                    static_cast<intptr_t>(decision.function->parameter_count),
                    argument_count);
     }
+    RecordAotCall();
     return false;
   }
   if (out_return_convention != nullptr) {
@@ -573,24 +674,28 @@ bool TryInvokePatchedFunctionImpl(Thread* thread,
                    function.ToFullyQualifiedCString(), function_id.c_str(),
                    result.error.c_str());
     }
-    *out_result = ApiErrorFromMessage(result.error);
-    return true;
+    runtime->DisablePatch(function_id);
+    ReportInterpretFailure(function_id, result.error);
+    RecordAotCall();
+    return false;
   }
+  RecordInterpreterCall();
 
   std::string conversion_error;
   if (!ValueToObject(thread, result.value, out_result, &conversion_error)) {
+    const std::string error =
+        conversion_error.empty() ? "unsupported return type for " + function_id
+                                 : conversion_error + " for " + function_id;
     if (FLAG_trace_fcb_dispatch) {
       OS::PrintErr("FCB TryInvoke return conversion error target=%s id=%s "
                    "error=%s\n",
                    function.ToFullyQualifiedCString(), function_id.c_str(),
-                   conversion_error.c_str());
+                   error.c_str());
     }
-    *out_result = ApiErrorFromMessage(conversion_error.empty()
-                                          ? "unsupported return type for " +
-                                                function_id
-                                          : conversion_error + " for " +
-                                                function_id);
-    return true;
+    runtime->DisablePatch(function_id);
+    ReportInterpretFailure(function_id, error);
+    RecordAotCall();
+    return false;
   }
   if (FLAG_trace_fcb_dispatch) {
     OS::PrintErr("FCB TryInvoke handled target=%s id=%s\n",
@@ -636,6 +741,172 @@ bool TryInvokePatchedFunction(Thread* thread,
   return TryInvokePatchedFunction(thread, function, raw_arguments, out_result);
 }
 
+bool TryInvokeBytecodeClosureTrampoline(Thread* thread,
+                                        const Function& function,
+                                        const Array& arguments,
+                                        const Array& arguments_descriptor,
+                                        ObjectPtr* out_result) {
+  if (thread == nullptr || out_result == nullptr ||
+      !internal::IsFcbBytecodeClosureTrampoline(function)) {
+    return false;
+  }
+  IsolateGroup* isolate_group = thread->isolate_group();
+  if (isolate_group == nullptr || isolate_group->fcb_patch_runtime() == nullptr) {
+    *out_result =
+        ApiErrorFromMessage("FCB bytecode closure runtime is unavailable");
+    return true;
+  }
+  const ArgumentsDescriptor args_desc(arguments_descriptor);
+  const intptr_t first_arg_index = args_desc.FirstArgIndex();
+  if (arguments.Length() <= first_arg_index) {
+    *out_result = ApiErrorFromMessage(
+        "FCB bytecode closure invocation missing closure receiver");
+    return true;
+  }
+
+  Zone* zone = thread->zone();
+  const Object& raw_receiver =
+      Object::Handle(zone, arguments.At(first_arg_index));
+  if (!raw_receiver.IsClosure()) {
+    *out_result =
+        ApiErrorFromMessage("FCB bytecode closure receiver is not a Closure");
+    return true;
+  }
+  const Closure& receiver = Closure::Cast(raw_receiver);
+  const Object& raw_context = Object::Handle(zone, receiver.RawContext());
+  if (!raw_context.IsContext()) {
+    *out_result =
+        ApiErrorFromMessage("FCB bytecode closure has no capture context");
+    return true;
+  }
+
+  const std::string function_id =
+      internal::FcbBytecodeClosureTargetId(function);
+  PatchRuntime* runtime = isolate_group->fcb_patch_runtime();
+  const DispatchDecision decision = runtime->Resolve(function_id);
+  if (decision.state != PatchState::kPatchedInterpreted ||
+      decision.function == nullptr) {
+    *out_result =
+        ApiErrorFromMessage("FCB bytecode closure target is not installed");
+    return true;
+  }
+  const Context& context = Context::Cast(raw_context);
+  const intptr_t capture_count = context.num_variables();
+  if (decision.function->parameter_count < capture_count) {
+    *out_result =
+        ApiErrorFromMessage("FCB bytecode closure capture count exceeds target "
+                            "parameter count");
+    return true;
+  }
+  const intptr_t exposed_parameter_count =
+      decision.function->parameter_count - capture_count;
+  const intptr_t expected_type_args_len = function.NumTypeParameters();
+  if (args_desc.TypeArgsLen() != expected_type_args_len) {
+    *out_result = ApiErrorFromMessage(
+        "FCB bytecode closure type argument count mismatch");
+    return true;
+  }
+  const intptr_t actual_positional_count = args_desc.PositionalCount() - 1;
+  const intptr_t named_count = function.NumOptionalNamedParameters();
+  const intptr_t optional_positional_count =
+      function.NumOptionalPositionalParameters();
+  const intptr_t expected_positional_count =
+      exposed_parameter_count - named_count;
+  if (actual_positional_count < 0 ||
+      expected_positional_count < optional_positional_count) {
+    *out_result =
+        ApiErrorFromMessage("FCB bytecode closure argument descriptor mismatch");
+    return true;
+  }
+  std::vector<Value> values;
+  values.reserve(decision.function->parameter_count);
+  std::string conversion_error;
+  for (intptr_t i = 0; i < capture_count; i++) {
+    const Object& capture = Object::Handle(zone, context.At(i));
+    Value value;
+    if (!ObjectToValue(thread, capture, &value, &conversion_error, 0)) {
+      *out_result = ApiErrorFromMessage(
+          "capture " + std::to_string(i) + " for " + function_id + ": " +
+          conversion_error);
+      return true;
+    }
+    values.push_back(std::move(value));
+  }
+  for (intptr_t i = 0; i < expected_positional_count; i++) {
+    if (i >= actual_positional_count) {
+      values.push_back(Value::Null());
+      continue;
+    }
+    const intptr_t argument_index = first_arg_index + 1 + i;
+    const Object& argument = Object::Handle(zone, arguments.At(argument_index));
+    Value value;
+    if (!ObjectToValue(thread, argument, &value, &conversion_error, 0)) {
+      *out_result = ApiErrorFromMessage(
+          "argument " + std::to_string(i) + " for " + function_id + ": " +
+          conversion_error);
+      return true;
+    }
+    values.push_back(std::move(value));
+  }
+  if (named_count > 0) {
+    String& expected_name = String::Handle(zone);
+    String& actual_name = String::Handle(zone);
+    for (intptr_t named_index = 0; named_index < named_count; named_index++) {
+      const intptr_t parameter_index =
+          function.num_fixed_parameters() + named_index;
+      expected_name = function.ParameterNameAt(parameter_index);
+      intptr_t argument_index = -1;
+      for (intptr_t i = 0; i < args_desc.NamedCount(); i++) {
+        actual_name = args_desc.NameAt(i);
+        if (actual_name.ptr() == expected_name.ptr()) {
+          argument_index = args_desc.PositionAt(i);
+          break;
+        }
+      }
+      if (argument_index < 0) {
+        if (function.IsRequiredAt(parameter_index)) {
+          *out_result = ApiErrorFromMessage(
+              "missing required bytecode closure named argument " +
+              StringToStdString(expected_name.ptr()));
+          return true;
+        }
+        values.push_back(Value::Null());
+        continue;
+      }
+      const Object& argument =
+          Object::Handle(zone, arguments.At(argument_index));
+      Value value;
+      if (!ObjectToValue(thread, argument, &value, &conversion_error, 0)) {
+        *out_result = ApiErrorFromMessage(
+            "named argument " + StringToStdString(expected_name.ptr()) +
+            " for " + function_id + ": " + conversion_error);
+        return true;
+      }
+      values.push_back(std::move(value));
+    }
+  }
+
+  InterpretResult result = runtime->Interpret(function_id, values,
+                                             capture_count);
+  if (!result.ok) {
+    runtime->DisablePatch(function_id);
+    ReportInterpretFailure(function_id, result.error);
+    *out_result = ApiErrorFromMessage(result.error);
+    RecordAotCall();
+    return true;
+  }
+  RecordInterpreterCall();
+  std::string return_error;
+  if (!ValueToObject(thread, result.value, out_result, &return_error)) {
+    runtime->DisablePatch(function_id);
+    ReportInterpretFailure(function_id, return_error);
+    *out_result = ApiErrorFromMessage(return_error);
+    RecordAotCall();
+    return true;
+  }
+  return true;
+}
+
 bool TryInvokeUniquePatchedFunctionByArity(Thread* thread,
                                            const std::vector<ObjectPtr>& arguments,
                                            ObjectPtr* out_result,
@@ -658,6 +929,7 @@ bool TryInvokeUniquePatchedFunctionByArity(Thread* thread,
       OS::PrintErr("FCB TryInvoke unique miss args=%" Pu "\n",
                    static_cast<intptr_t>(arguments.size()));
     }
+    RecordAotCall();
     return false;
   }
   if (out_return_convention != nullptr) {
@@ -685,14 +957,27 @@ bool TryInvokeUniquePatchedFunctionByArity(Thread* thread,
       OS::PrintErr("FCB TryInvoke unique interpreter error id=%s error=%s\n",
                    function_id.c_str(), result.error.c_str());
     }
-    *out_result = ApiErrorFromMessage(function_id + ": " + result.error);
-    return true;
+    runtime->DisablePatch(function_id);
+    ReportInterpretFailure(function_id, result.error);
+    RecordAotCall();
+    return false;
   }
+  RecordInterpreterCall();
   std::string conversion_error;
   if (!ValueToObject(thread, result.value, out_result, &conversion_error)) {
-    *out_result = ApiErrorFromMessage("return value for " + function_id + ": " +
-                                      conversion_error);
-    return true;
+    const std::string error = "return value for " + function_id + ": " +
+                              (conversion_error.empty()
+                                   ? "unsupported return type"
+                                   : conversion_error);
+    if (FLAG_trace_fcb_dispatch) {
+      OS::PrintErr("FCB TryInvoke unique return conversion error id=%s "
+                   "error=%s\n",
+                   function_id.c_str(), error.c_str());
+    }
+    runtime->DisablePatch(function_id);
+    ReportInterpretFailure(function_id, error);
+    RecordAotCall();
+    return false;
   }
   if (FLAG_trace_fcb_dispatch) {
     OS::PrintErr("FCB TryInvoke unique handled id=%s\n", function_id.c_str());

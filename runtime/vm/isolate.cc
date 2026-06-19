@@ -3058,6 +3058,11 @@ void IsolateGroup::VisitSharedPointers(ObjectPointerVisitor* visitor,
       }
 #endif  // !defined(PRODUCT)
       break;
+    case kFcbPatchRuntime:
+      if (fcb_patch_runtime_ != nullptr) {
+        fcb_patch_runtime_->VisitObjectPointers(visitor);
+      }
+      break;
     default:
       UNREACHABLE();
   }

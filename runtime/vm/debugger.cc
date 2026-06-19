@@ -15,6 +15,7 @@
 #include "vm/compiler/assembler/disassembler_kbc.h"
 #include "vm/compiler/jit/compiler.h"
 #include "vm/dart_entry.h"
+#include "vm/fcb_patch_runtime_internal.h"
 #include "vm/flags.h"
 #include "vm/globals.h"
 #include "vm/isolate_reload.h"
@@ -41,6 +42,9 @@
 #include "vm/visitor.h"
 #include "vm/zone_text_buffer.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #if !defined(DART_PRECOMPILED_RUNTIME)
 #include "vm/deopt_instructions.h"
 #endif  // !defined(DART_PRECOMPILED_RUNTIME)
@@ -62,6 +66,12 @@ DECLARE_FLAG(bool, trace_deoptimization);
 DECLARE_FLAG(bool, warn_on_pause_with_no_debugger);
 
 #ifndef PRODUCT
+
+static bool ParseFcbPatchSourceLocation(const char* location,
+                                        const char** source_uri,
+                                        intptr_t* source_uri_length,
+                                        intptr_t* line,
+                                        intptr_t* column);
 
 // Create an unresolved breakpoint in given token range and script.
 BreakpointLocation::BreakpointLocation(
@@ -244,6 +254,14 @@ ActivationFrame::ActivationFrame(uword pc,
       code_or_bytecode_(Object::ZoneHandle(code_or_bytecode.ptr())),
       function_(Function::ZoneHandle(function.ptr())),
       closure_(Closure::null_closure()),
+      fcb_patch_source_location_(String::ZoneHandle(String::null())),
+      fcb_patch_function_id_(String::ZoneHandle(String::null())),
+      fcb_patch_local_names_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_local_values_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_materialized_(
+          Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_kinds_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_previews_(Array::ZoneHandle(Array::empty_array().ptr())),
       deopt_frame_(Array::ZoneHandle(deopt_frame.ptr())),
       deopt_frame_offset_(deopt_frame_offset),
       kind_(kRegular),
@@ -261,16 +279,113 @@ ActivationFrame::ActivationFrame(uword pc,
       code_or_bytecode_(Object::ZoneHandle(code_or_bytecode.ptr())),
       function_(Function::ZoneHandle(function.ptr())),
       closure_(Closure::ZoneHandle(closure.ptr())),
+      fcb_patch_source_location_(String::ZoneHandle(String::null())),
+      fcb_patch_function_id_(String::ZoneHandle(String::null())),
+      fcb_patch_local_names_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_local_values_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_materialized_(
+          Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_kinds_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_previews_(Array::ZoneHandle(Array::empty_array().ptr())),
       deopt_frame_(Array::empty_array()),
       deopt_frame_offset_(0),
       kind_(kAsyncAwaiter) {
   ASSERT(code_or_bytecode.IsCode() || code_or_bytecode.IsBytecode());
 }
 
+ActivationFrame::ActivationFrame(const String& fcb_patch_source_location)
+    : code_or_bytecode_(Object::null_object()),
+      function_(Function::null_function()),
+      closure_(Closure::null_closure()),
+      fcb_patch_source_location_(
+          String::ZoneHandle(fcb_patch_source_location.ptr())),
+      fcb_patch_function_id_(String::ZoneHandle(String::null())),
+      fcb_patch_local_names_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_local_values_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_materialized_(
+          Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_kinds_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_previews_(Array::ZoneHandle(Array::empty_array().ptr())),
+      deopt_frame_(Array::empty_array()),
+      deopt_frame_offset_(0),
+      kind_(kFcbPatch) {
+  ASSERT(!fcb_patch_source_location.IsNull());
+}
+
+ActivationFrame::ActivationFrame(const String& fcb_patch_source_location,
+                                 const String& fcb_patch_function_id,
+                                 intptr_t fcb_patch_bytecode_offset)
+    : code_or_bytecode_(Object::null_object()),
+      function_(Function::null_function()),
+      closure_(Closure::null_closure()),
+      fcb_patch_source_location_(
+          String::ZoneHandle(fcb_patch_source_location.ptr())),
+      fcb_patch_function_id_(String::ZoneHandle(fcb_patch_function_id.ptr())),
+      fcb_patch_bytecode_offset_(fcb_patch_bytecode_offset),
+      fcb_patch_local_names_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_local_values_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_materialized_(
+          Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_kinds_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_previews_(Array::ZoneHandle(Array::empty_array().ptr())),
+      deopt_frame_(Array::empty_array()),
+      deopt_frame_offset_(0),
+      kind_(kFcbPatch) {
+  ASSERT(!fcb_patch_source_location.IsNull());
+}
+
+ActivationFrame::ActivationFrame(const String& fcb_patch_source_location,
+                                 const String& fcb_patch_function_id,
+                                 intptr_t fcb_patch_bytecode_offset,
+                                 intptr_t fcb_patch_argument_count,
+                                 intptr_t fcb_patch_captured_slot_count,
+                                 intptr_t fcb_patch_active_handler_count,
+                                 intptr_t fcb_patch_innermost_handler_offset,
+                                 intptr_t fcb_patch_innermost_handler_end_offset,
+                                 const Array& fcb_patch_local_names,
+                                 const Array& fcb_patch_local_values,
+                                 const Array& fcb_patch_value_materialized,
+                                 const Array& fcb_patch_value_kinds,
+                                 const Array& fcb_patch_value_previews)
+    : code_or_bytecode_(Object::null_object()),
+      function_(Function::null_function()),
+      closure_(Closure::null_closure()),
+      fcb_patch_source_location_(
+          String::ZoneHandle(fcb_patch_source_location.ptr())),
+      fcb_patch_function_id_(String::ZoneHandle(fcb_patch_function_id.ptr())),
+      fcb_patch_bytecode_offset_(fcb_patch_bytecode_offset),
+      fcb_patch_argument_count_(fcb_patch_argument_count),
+      fcb_patch_captured_slot_count_(fcb_patch_captured_slot_count),
+      fcb_patch_active_handler_count_(fcb_patch_active_handler_count),
+      fcb_patch_innermost_handler_offset_(
+          fcb_patch_innermost_handler_offset),
+      fcb_patch_innermost_handler_end_offset_(
+          fcb_patch_innermost_handler_end_offset),
+      fcb_patch_local_names_(Array::ZoneHandle(fcb_patch_local_names.ptr())),
+      fcb_patch_local_values_(Array::ZoneHandle(fcb_patch_local_values.ptr())),
+      fcb_patch_value_materialized_(
+          Array::ZoneHandle(fcb_patch_value_materialized.ptr())),
+      fcb_patch_value_kinds_(Array::ZoneHandle(fcb_patch_value_kinds.ptr())),
+      fcb_patch_value_previews_(
+          Array::ZoneHandle(fcb_patch_value_previews.ptr())),
+      deopt_frame_(Array::empty_array()),
+      deopt_frame_offset_(0),
+      kind_(kFcbPatch) {
+  ASSERT(!fcb_patch_source_location.IsNull());
+}
+
 ActivationFrame::ActivationFrame(Kind kind)
     : code_or_bytecode_(Object::null_object()),
       function_(Function::null_function()),
       closure_(Closure::null_closure()),
+      fcb_patch_source_location_(String::ZoneHandle(String::null())),
+      fcb_patch_function_id_(String::ZoneHandle(String::null())),
+      fcb_patch_local_names_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_local_values_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_materialized_(
+          Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_kinds_(Array::ZoneHandle(Array::empty_array().ptr())),
+      fcb_patch_value_previews_(Array::ZoneHandle(Array::empty_array().ptr())),
       deopt_frame_(Array::empty_array()),
       deopt_frame_offset_(0),
       kind_(kind) {
@@ -510,19 +625,47 @@ ActivationFrame::Relation ActivationFrame::CompareTo(bool is_interpreted,
 }
 
 StringPtr ActivationFrame::QualifiedFunctionName() {
+  if (IsFcbPatchFrame()) {
+    if (!fcb_patch_function_id().IsNull() &&
+        fcb_patch_function_id().Length() > 0) {
+      return fcb_patch_function_id().ptr();
+    }
+    return String::New("<fcb patch>");
+  }
   return String::New(::dart::QualifiedFunctionName(function()));
 }
 
 StringPtr ActivationFrame::SourceUrl() {
+  if (IsFcbPatchFrame()) {
+    Zone* zone = Thread::Current()->zone();
+    const char* location = fcb_patch_source_location().ToCString();
+    const char* source_uri = location;
+    intptr_t source_uri_length = strlen(location);
+    intptr_t line = -1;
+    intptr_t column = -1;
+    ParseFcbPatchSourceLocation(location, &source_uri, &source_uri_length,
+                                &line, &column);
+    return String::New(zone->PrintToString(
+        "%.*s", static_cast<int>(source_uri_length), source_uri));
+  }
+  ASSERT(!IsFcbPatchFrame());
   const Script& script = Script::Handle(SourceScript());
   return script.url();
 }
 
 ScriptPtr ActivationFrame::SourceScript() {
+  if (IsFcbPatchFrame()) {
+    return Script::null();
+  }
+  ASSERT(!IsFcbPatchFrame());
   return function().script();
 }
 
 LibraryPtr ActivationFrame::Library() {
+  if (IsFcbPatchFrame()) {
+    return Library::null();
+  }
+  ASSERT(!IsFcbPatchFrame());
   const Class& cls = Class::Handle(function().Owner());
   return cls.library();
 }
@@ -538,6 +681,10 @@ void ActivationFrame::GetPcDescriptors() {
 // If not token_pos_initialized_, compute token_pos_, try_index_ and,
 // if not IsInterpreted(), also compute deopt_id_.
 TokenPosition ActivationFrame::TokenPos() {
+  if (IsFcbPatchFrame()) {
+    return TokenPosition::kNoSource;
+  }
+  ASSERT(!IsFcbPatchFrame());
   if (!token_pos_initialized_) {
     token_pos_ = TokenPosition::kNoSource;
     if (IsInterpreted()) {
@@ -577,6 +724,16 @@ intptr_t ActivationFrame::DeoptId() {
 }
 
 intptr_t ActivationFrame::LineNumber() {
+  if (IsFcbPatchFrame()) {
+    const char* location = fcb_patch_source_location().ToCString();
+    const char* source_uri = location;
+    intptr_t source_uri_length = strlen(location);
+    intptr_t line = -1;
+    intptr_t column = -1;
+    ParseFcbPatchSourceLocation(location, &source_uri, &source_uri_length,
+                                &line, &column);
+    return line;
+  }
   // Compute line number lazily since it causes scanning of the script.
   const TokenPosition& token_pos = TokenPos().ToRealIfSynthetic();
   if ((line_number_ < 0) && token_pos.IsReal()) {
@@ -587,6 +744,16 @@ intptr_t ActivationFrame::LineNumber() {
 }
 
 intptr_t ActivationFrame::ColumnNumber() {
+  if (IsFcbPatchFrame()) {
+    const char* location = fcb_patch_source_location().ToCString();
+    const char* source_uri = location;
+    intptr_t source_uri_length = strlen(location);
+    intptr_t line = -1;
+    intptr_t column = -1;
+    ParseFcbPatchSourceLocation(location, &source_uri, &source_uri_length,
+                                &line, &column);
+    return column;
+  }
   // Compute column number lazily since it causes scanning of the script.
   const TokenPosition& token_pos = TokenPos().ToRealIfSynthetic();
   if ((column_number_ < 0) && token_pos.IsReal()) {
@@ -629,6 +796,9 @@ void ActivationFrame::GetVarDescriptors() {
 }
 
 bool ActivationFrame::IsDebuggable() const {
+  if (IsFcbPatchFrame()) {
+    return true;
+  }
   ASSERT(!function().IsNull());
   return Debugger::IsDebuggable(function());
 }
@@ -731,6 +901,9 @@ intptr_t ActivationFrame::ContextLevel() {
 }
 
 bool ActivationFrame::HandlesException(const Instance& exc_obj) {
+  if (IsFcbPatchFrame()) {
+    return fcb_patch_active_handler_count() > 0;
+  }
   if (kind_ == kAsyncSuspensionMarker) {
     return false;
   }
@@ -914,6 +1087,9 @@ void ActivationFrame::GetDescIndices() {
 }
 
 intptr_t ActivationFrame::NumLocalVariables() {
+  if (IsFcbPatchFrame()) {
+    return fcb_patch_local_names_.Length();
+  }
   GetDescIndices();
   return desc_indices_.length();
 }
@@ -990,6 +1166,9 @@ ObjectPtr ActivationFrame::GetStackVar(VariableIndex variable_index) {
 }
 
 bool ActivationFrame::IsRewindable() const {
+  if (IsFcbPatchFrame()) {
+    return false;
+  }
   if (deopt_frame_.IsNull()) {
     return true;
   }
@@ -1060,6 +1239,21 @@ void ActivationFrame::VariableAt(intptr_t i,
                                  TokenPosition* visible_start_token_pos,
                                  TokenPosition* visible_end_token_pos,
                                  Object* value) {
+  if (IsFcbPatchFrame()) {
+    ASSERT(i < fcb_patch_local_names_.Length());
+    ASSERT(i < fcb_patch_local_values_.Length());
+    ASSERT(name != nullptr);
+    *name ^= fcb_patch_local_names_.At(i);
+    ASSERT(declaration_token_pos != nullptr);
+    *declaration_token_pos = TokenPosition::kNoSource;
+    ASSERT(visible_start_token_pos != nullptr);
+    *visible_start_token_pos = TokenPosition::kNoSource;
+    ASSERT(visible_end_token_pos != nullptr);
+    *visible_end_token_pos = TokenPosition::kNoSource;
+    ASSERT(value != nullptr);
+    *value = fcb_patch_local_values_.At(i);
+    return;
+  }
   GetDescIndices();
   ASSERT(i < desc_indices_.length());
   intptr_t desc_index = desc_indices_[i];
@@ -1132,6 +1326,9 @@ ObjectPtr ActivationFrame::GetRelativeContextVar(intptr_t var_ctx_level,
 }
 
 ObjectPtr ActivationFrame::GetReceiver() {
+  if (IsFcbPatchFrame()) {
+    return Object::null();
+  }
   GetDescIndices();
   intptr_t num_variables = desc_indices_.length();
   String& var_name = String::Handle();
@@ -1162,6 +1359,24 @@ ObjectPtr ActivationFrame::EvaluateCompiledExpression(
   auto thread = Thread::Current();
   auto zone = thread->zone();
 
+  if (IsFcbPatchFrame()) {
+    const String& source_url = String::Handle(zone, SourceUrl());
+    const ::dart::Library& library = ::dart::Library::Handle(
+        zone, ::dart::Library::LookupLibrary(thread, source_url));
+    if (library.IsNull()) {
+      const String& error = String::Handle(
+          zone, String::NewFormatted(
+                    "Expression evaluation is not available for FCB patch "
+                    "frame source '%s': library not found.",
+                    source_url.ToCString()));
+      return ApiError::New(error);
+    }
+    const Class& klass = Class::Handle(zone, library.toplevel_class());
+    return Instance::EvaluateCompiledExpression(
+        thread, Object::Handle(zone, Object::null()), library, klass,
+        kernel_buffer, type_definitions, arguments, type_arguments);
+  }
+
   // The expression evaluation function will get all it's captured state passed
   // as parameters (with `this` being the exception). As a result, we treat the
   // expression evaluation function as either a top-level, static or instance
@@ -1188,6 +1403,22 @@ TypeArgumentsPtr ActivationFrame::BuildParameters(
     const GrowableObjectArray& type_params_names,
     const GrowableObjectArray& type_params_bounds,
     const GrowableObjectArray& type_params_defaults) {
+  if (IsFcbPatchFrame()) {
+    Object& name = Object::Handle();
+    Object& value = Object::Handle();
+    for (intptr_t i = 0; i < fcb_patch_local_names_.Length(); i++) {
+      if (i < fcb_patch_value_materialized_.Length() &&
+          fcb_patch_value_materialized_.At(i) == Bool::False().ptr()) {
+        continue;
+      }
+      name = fcb_patch_local_names_.At(i);
+      value = fcb_patch_local_values_.At(i);
+      param_names.Add(name);
+      param_values.Add(value);
+    }
+    return TypeArguments::null();
+  }
+
   GetDescIndices();
   bool type_arguments_available = false;
   String& name = String::Handle();
@@ -1279,6 +1510,17 @@ TypeArgumentsPtr ActivationFrame::BuildParameters(
 }
 
 const char* ActivationFrame::ToCString() {
+  if (IsFcbPatchFrame()) {
+    return Thread::Current()->zone()->PrintToString(
+        "[ Frame kind: %s\n"
+        "\tfunction = %s\n"
+        "\tbytecode offset = %" Pd "\n"
+        "\tfcb patch location = %s ]\n",
+        KindToCString(kind_),
+        fcb_patch_function_id().IsNull() ? "<fcb patch>"
+                                         : fcb_patch_function_id().ToCString(),
+        fcb_patch_bytecode_offset(), fcb_patch_source_location().ToCString());
+  }
   if (function().IsNull()) {
     return Thread::Current()->zone()->PrintToString("[ Frame kind: %s]\n",
                                                     KindToCString(kind_));
@@ -1319,6 +1561,8 @@ void ActivationFrame::PrintToJSONObject(JSONObject* jsobj) {
     PrintToJSONObjectAsyncAwaiter(jsobj);
   } else if (kind_ == kAsyncSuspensionMarker) {
     PrintToJSONObjectAsyncSuspensionMarker(jsobj);
+  } else if (kind_ == kFcbPatch) {
+    PrintToJSONObjectFcbPatch(jsobj);
   } else {
     UNIMPLEMENTED();
   }
@@ -1385,12 +1629,279 @@ void ActivationFrame::PrintToJSONObjectAsyncSuspensionMarker(
   jsobj->AddProperty("marker", "AsynchronousSuspension");
 }
 
+static bool ParseFcbPatchSourceLocation(const char* location,
+                                        const char** source_uri,
+                                        intptr_t* source_uri_length,
+                                        intptr_t* line,
+                                        intptr_t* column) {
+  *source_uri = location;
+  *source_uri_length = strlen(location);
+  *line = -1;
+  *column = -1;
+
+  const char* const column_separator = strrchr(location, ':');
+  if (column_separator == nullptr || column_separator == location) {
+    return false;
+  }
+  char* column_end = nullptr;
+  const long parsed_column = strtol(column_separator + 1, &column_end, 10);
+  if (column_end == column_separator + 1 || *column_end != '\0' ||
+      parsed_column < 0) {
+    return false;
+  }
+
+  const intptr_t before_column = column_separator - location;
+  const char* line_separator = nullptr;
+  for (intptr_t i = before_column - 1; i >= 0; i--) {
+    if (location[i] == ':') {
+      line_separator = &location[i];
+      break;
+    }
+  }
+  if (line_separator == nullptr || line_separator == location) {
+    return false;
+  }
+  char* line_end = nullptr;
+  const long parsed_line = strtol(line_separator + 1, &line_end, 10);
+  if (line_end != column_separator || parsed_line < 0) {
+    return false;
+  }
+
+  *source_uri_length = line_separator - location;
+  *line = static_cast<intptr_t>(parsed_line);
+  *column = static_cast<intptr_t>(parsed_column);
+  return true;
+}
+
+static void AddFcbPatchScopeObject(JSONObject* scope,
+                                   const char* name,
+                                   intptr_t start,
+                                   intptr_t count,
+                                   const Array& local_names) {
+  scope->AddProperty("name", name);
+  scope->AddProperty("start", start);
+  scope->AddProperty("count", count);
+  JSONArray variables(scope, "variables");
+  String& variable_name = String::Handle();
+  for (intptr_t i = 0; i < count; i++) {
+    const intptr_t index = start + i;
+    if (index < 0 || index >= local_names.Length()) {
+      continue;
+    }
+    variable_name ^= local_names.At(index);
+    variables.AddValue(variable_name.ToCString());
+  }
+}
+
+static const char* FcbPatchScopeNameForSlot(intptr_t slot,
+                                            intptr_t argument_count,
+                                            intptr_t captured_slot_count) {
+  if (slot < argument_count) {
+    return slot < captured_slot_count ? "captured" : "arguments";
+  }
+  return "locals";
+}
+
+static const char* FcbPatchValueKindName(const Object& value) {
+  if (value.IsNull()) return "null";
+  if (value.IsInteger()) return "int";
+  if (value.IsDouble()) return "double";
+  if (value.IsBool()) return "bool";
+  if (value.IsString()) return "string";
+  if (value.IsArray()) return "array";
+  if (value.IsMap()) return "map";
+  if (value.IsInstance()) return "instance";
+  return "object";
+}
+
+static const char* FcbPatchValueKindName(const fcb::Value& value) {
+  switch (value.kind) {
+    case fcb::ValueKind::kNull:
+      return "null";
+    case fcb::ValueKind::kInt:
+      return "int";
+    case fcb::ValueKind::kDouble:
+      return "double";
+    case fcb::ValueKind::kBool:
+      return "bool";
+    case fcb::ValueKind::kString:
+      return "string";
+    case fcb::ValueKind::kList:
+      return "list";
+    case fcb::ValueKind::kMap:
+      return "map";
+    case fcb::ValueKind::kBytecodeClosure:
+      return "bytecode_closure";
+  }
+  return "unknown";
+}
+
+static const char* FcbPatchValuePreview(Zone* zone, const fcb::Value& value) {
+  switch (value.kind) {
+    case fcb::ValueKind::kNull:
+      return "null";
+    case fcb::ValueKind::kInt:
+      return zone->PrintToString("%" Pd64, value.int_value);
+    case fcb::ValueKind::kDouble:
+      return zone->PrintToString("%f", value.double_value);
+    case fcb::ValueKind::kBool:
+      return value.bool_value ? "true" : "false";
+    case fcb::ValueKind::kString:
+      return value.string_value.c_str();
+    case fcb::ValueKind::kList:
+      return zone->PrintToString("List(length=%" Pd ")",
+                                 static_cast<intptr_t>(
+                                     value.list_value.size()));
+    case fcb::ValueKind::kMap:
+      return zone->PrintToString("Map(length=%" Pd ")",
+                                 static_cast<intptr_t>(
+                                     value.map_entries.size() / 2));
+    case fcb::ValueKind::kBytecodeClosure:
+      return zone->PrintToString(
+          "BytecodeClosure(function=%s,captures=%" Pd ")",
+          value.closure_function_id.c_str(),
+          static_cast<intptr_t>(value.closure_captures.size()));
+  }
+  return "unknown";
+}
+
+void ActivationFrame::PrintToJSONObjectFcbPatch(JSONObject* jsobj) {
+  Zone* zone = Thread::Current()->zone();
+  const char* location = fcb_patch_source_location().ToCString();
+  const char* source_uri = location;
+  intptr_t source_uri_length = strlen(location);
+  intptr_t line = -1;
+  intptr_t column = -1;
+  ParseFcbPatchSourceLocation(location, &source_uri, &source_uri_length, &line,
+                              &column);
+
+  jsobj->AddProperty("type", "Frame");
+  jsobj->AddProperty("kind", KindToCString(kind_));
+  jsobj->AddProperty("function",
+                     fcb_patch_function_id().IsNull()
+                         ? "<fcb patch>"
+                         : fcb_patch_function_id().ToCString());
+  jsobj->AddProperty("fcbPatchLocation", location);
+  if (!fcb_patch_function_id().IsNull() &&
+      fcb_patch_function_id().Length() > 0) {
+    jsobj->AddProperty("fcbPatchFunctionId",
+                       fcb_patch_function_id().ToCString());
+  }
+  if (fcb_patch_bytecode_offset() >= 0) {
+    jsobj->AddProperty("fcbPatchBytecodeOffset",
+                       fcb_patch_bytecode_offset());
+  }
+  if (fcb_patch_argument_count() > 0) {
+    jsobj->AddProperty("fcbPatchArgumentCount", fcb_patch_argument_count());
+  }
+  if (fcb_patch_captured_slot_count() > 0) {
+    jsobj->AddProperty("fcbPatchCapturedSlotCount",
+                       fcb_patch_captured_slot_count());
+  }
+  if (fcb_patch_active_handler_count() > 0) {
+    jsobj->AddProperty("fcbPatchActiveHandlerCount",
+                       fcb_patch_active_handler_count());
+    jsobj->AddProperty("fcbPatchInnermostHandlerOffset",
+                       fcb_patch_innermost_handler_offset());
+    jsobj->AddProperty("fcbPatchInnermostHandlerEndOffset",
+                       fcb_patch_innermost_handler_end_offset());
+  }
+  if (fcb_patch_local_names_.Length() > 0) {
+    JSONObject scope(jsobj, "fcbPatchScope");
+    scope.AddProperty("type", "FcbPatchScope");
+    scope.AddProperty("variableCount", fcb_patch_local_names_.Length());
+    scope.AddProperty("argumentCount", fcb_patch_argument_count());
+    scope.AddProperty("capturedSlotCount", fcb_patch_captured_slot_count());
+    JSONArray sections(&scope, "sections");
+    const intptr_t captured_count =
+        fcb_patch_captured_slot_count() < fcb_patch_argument_count()
+            ? fcb_patch_captured_slot_count()
+            : fcb_patch_argument_count();
+    if (captured_count > 0) {
+      JSONObject captured(&sections);
+      AddFcbPatchScopeObject(&captured, "captured", 0, captured_count,
+                             fcb_patch_local_names_);
+    }
+    const intptr_t call_argument_count =
+        fcb_patch_argument_count() - captured_count;
+    if (call_argument_count > 0) {
+      JSONObject arguments(&sections);
+      AddFcbPatchScopeObject(&arguments, "arguments", captured_count,
+                             call_argument_count, fcb_patch_local_names_);
+    }
+    const intptr_t local_count =
+        fcb_patch_local_names_.Length() - fcb_patch_argument_count();
+    if (local_count > 0) {
+      JSONObject locals(&sections);
+      AddFcbPatchScopeObject(&locals, "locals", fcb_patch_argument_count(),
+                             local_count, fcb_patch_local_names_);
+    }
+  }
+  if (fcb_patch_local_names_.Length() > 0) {
+    JSONArray vars(jsobj, "fcbPatchVars");
+    String& name = String::Handle(zone);
+    Object& value = Object::Handle(zone);
+    const intptr_t value_count = fcb_patch_local_values_.Length();
+    const intptr_t materialized_count = fcb_patch_value_materialized_.Length();
+    const intptr_t kind_count = fcb_patch_value_kinds_.Length();
+    const intptr_t preview_count = fcb_patch_value_previews_.Length();
+    for (intptr_t i = 0; i < fcb_patch_local_names_.Length(); i++) {
+      JSONObject var(&vars);
+      name ^= fcb_patch_local_names_.At(i);
+      var.AddProperty("type", "FcbPatchBoundVariable");
+      var.AddProperty("name", name.ToCString());
+      var.AddProperty("slot", i);
+      var.AddProperty("scope", FcbPatchScopeNameForSlot(
+                                   i, fcb_patch_argument_count(),
+                                   fcb_patch_captured_slot_count()));
+      if (i < materialized_count) {
+        value = fcb_patch_value_materialized_.At(i);
+        var.AddProperty("valueMaterialized", Bool::Cast(value).value());
+      }
+      if (i < kind_count) {
+        value = fcb_patch_value_kinds_.At(i);
+        var.AddProperty("valueKind", String::Cast(value).ToCString());
+      }
+      if (i < preview_count) {
+        value = fcb_patch_value_previews_.At(i);
+        var.AddProperty("valuePreview", String::Cast(value).ToCString());
+        continue;
+      }
+      if (i < value_count) {
+        value = fcb_patch_local_values_.At(i);
+        if (i >= materialized_count) {
+          var.AddProperty("valueMaterialized", true);
+        }
+        if (i >= kind_count) {
+        var.AddProperty("valueKind", FcbPatchValueKindName(value));
+        }
+        var.AddProperty("valuePreview", value.ToCString());
+      } else if (i >= materialized_count) {
+        var.AddProperty("valueMaterialized", false);
+      }
+    }
+  }
+
+  JSONObject location_obj(jsobj, "location");
+  location_obj.AddProperty("type", "FcbPatchSourceLocation");
+  location_obj.AddProperty(
+      "sourceUri",
+      zone->PrintToString("%.*s", static_cast<int>(source_uri_length),
+                          source_uri));
+  if (line >= 0) {
+    location_obj.AddProperty("line", line);
+  }
+  if (column >= 0) {
+    location_obj.AddProperty("column", column);
+  }
+}
+
 static bool IsFunctionVisible(const Function& function) {
   return FLAG_show_invisible_frames || function.is_visible();
 }
 
 void DebuggerStackTrace::AddActivation(ActivationFrame* frame) {
-  if (IsFunctionVisible(frame->function())) {
+  if (frame->IsFcbPatchFrame() || IsFunctionVisible(frame->function())) {
     trace_.Add(frame);
   }
 }
@@ -1864,6 +2375,7 @@ DebuggerStackTrace* DebuggerStackTrace::Collect() {
       OS::PrintErr("    non-Dart frame skipped\n");
     }
   }
+  stack_trace->AppendFcbPatchFrames();
   if (FLAG_trace_debugger_stacktrace) {
     OS::PrintErr("CollectStackTrace: collection finished\n\n");
   }
@@ -1913,6 +2425,137 @@ void DebuggerStackTrace::AppendBytecodeFrame(StackFrame* frame,
                                              const Bytecode& bytecode) {
   AddActivation(CollectDartFrame(frame->pc(), frame, function, bytecode,
                                  Object::null_array(), 0));
+}
+
+static ObjectPtr MaterializeFcbPatchDebugValue(const fcb::Value& value) {
+  fcb::Value copy = value;
+  ObjectPtr object = copy.ToDart();
+  return object == nullptr ? Object::null() : object;
+}
+
+static const char* FcbPatchDebugLocalName(
+    const fcb::internal::PatchStackTraceFrameInfo& frame_info,
+    uint16_t slot) {
+  if (frame_info.function == nullptr) {
+    return nullptr;
+  }
+  for (const fcb::DebugLocalEntry& entry : frame_info.function->debug_locals) {
+    if (entry.slot == slot && !entry.name.empty()) {
+      return entry.name.c_str();
+    }
+  }
+  return nullptr;
+}
+
+static void BuildFcbPatchDebugLocals(
+    Zone* zone,
+    const fcb::internal::PatchStackTraceFrameInfo& frame_info,
+    Array* names,
+    Array* values,
+    Array* value_materialized,
+    Array* value_kinds,
+    Array* value_previews) {
+  const intptr_t argument_count =
+      static_cast<intptr_t>(frame_info.argument_count);
+  const intptr_t local_count = static_cast<intptr_t>(frame_info.local_count);
+  const intptr_t total_count = argument_count + local_count;
+  ASSERT(names != nullptr);
+  ASSERT(values != nullptr);
+  ASSERT(value_materialized != nullptr);
+  ASSERT(value_kinds != nullptr);
+  ASSERT(value_previews != nullptr);
+  *names ^= Array::New(total_count, Heap::kOld);
+  *values ^= Array::New(total_count, Heap::kOld);
+  *value_materialized ^= Array::New(total_count, Heap::kOld);
+  *value_kinds ^= Array::New(total_count, Heap::kOld);
+  *value_previews ^= Array::New(total_count, Heap::kOld);
+  auto thread = Thread::Current();
+  String& name = String::Handle(zone);
+  Object& value = Object::Handle(zone);
+  Object& materialized = Object::Handle(zone);
+  String& value_kind = String::Handle(zone);
+  String& value_preview = String::Handle(zone);
+  for (intptr_t i = 0; i < argument_count; i++) {
+    const char* debug_name =
+        FcbPatchDebugLocalName(frame_info, static_cast<uint16_t>(i));
+    name = debug_name == nullptr ? String::NewFormatted("arg%" Pd, i)
+                                 : String::New(debug_name);
+    const fcb::Value& fcb_value = frame_info.arguments[i];
+    value = MaterializeFcbPatchDebugValue(fcb_value);
+    materialized = value.IsNull() && fcb_value.kind != fcb::ValueKind::kNull
+                       ? Bool::False().ptr()
+                       : Bool::True().ptr();
+    value_kind = String::New(FcbPatchValueKindName(fcb_value));
+    value_preview = String::New(FcbPatchValuePreview(zone, fcb_value));
+    names->SetAt(i, name, thread);
+    values->SetAt(i, value, thread);
+    value_materialized->SetAt(i, materialized, thread);
+    value_kinds->SetAt(i, value_kind, thread);
+    value_previews->SetAt(i, value_preview, thread);
+  }
+  for (intptr_t i = 0; i < local_count; i++) {
+    const intptr_t output_index = argument_count + i;
+    const intptr_t slot = argument_count + i;
+    const char* debug_name =
+        slot > kMaxUint16
+            ? nullptr
+            : FcbPatchDebugLocalName(frame_info, static_cast<uint16_t>(slot));
+    name = debug_name == nullptr ? String::NewFormatted("local%" Pd, i)
+                                 : String::New(debug_name);
+    const fcb::Value& fcb_value = frame_info.locals[i];
+    value = MaterializeFcbPatchDebugValue(fcb_value);
+    materialized = value.IsNull() && fcb_value.kind != fcb::ValueKind::kNull
+                       ? Bool::False().ptr()
+                       : Bool::True().ptr();
+    value_kind = String::New(FcbPatchValueKindName(fcb_value));
+    value_preview = String::New(FcbPatchValuePreview(zone, fcb_value));
+    names->SetAt(output_index, name, thread);
+    values->SetAt(output_index, value, thread);
+    value_materialized->SetAt(output_index, materialized, thread);
+    value_kinds->SetAt(output_index, value_kind, thread);
+    value_previews->SetAt(output_index, value_preview, thread);
+  }
+}
+
+void DebuggerStackTrace::AppendFcbPatchFrames() {
+  const std::size_t active_count = fcb::internal::ActivePatchFrameCount();
+  const std::size_t count =
+      active_count > 0 ? active_count
+                       : fcb::internal::PatchStackTraceLocationCount();
+  for (std::size_t i = 0; i < count; i++) {
+    const fcb::internal::PatchStackTraceFrameInfo frame_info =
+        active_count > 0 ? fcb::internal::ActivePatchFrameInfoAt(i)
+                         : fcb::internal::PatchStackTraceFrameInfoAt(i);
+    const char* location = frame_info.source_location;
+    if (location == nullptr || location[0] == '\0') {
+      continue;
+    }
+    const String& location_string =
+        String::Handle(zone_, String::New(location, Heap::kOld));
+    const String& function_id_string = String::Handle(
+        zone_, String::New(frame_info.function_id == nullptr
+                               ? ""
+                               : frame_info.function_id,
+                           Heap::kOld));
+    Array& local_names = Array::Handle(zone_);
+    Array& local_values = Array::Handle(zone_);
+    Array& value_materialized = Array::Handle(zone_);
+    Array& value_kinds = Array::Handle(zone_);
+    Array& value_previews = Array::Handle(zone_);
+    BuildFcbPatchDebugLocals(zone_, frame_info, &local_names, &local_values,
+                             &value_materialized, &value_kinds,
+                             &value_previews);
+    AddActivation(new ActivationFrame(location_string, function_id_string,
+                                      frame_info.bytecode_offset,
+                                      frame_info.argument_count,
+                                      frame_info.captured_argument_count,
+                                      frame_info.active_handler_count,
+                                      frame_info.innermost_handler_offset,
+                                      frame_info.innermost_handler_end_offset,
+                                      local_names, local_values,
+                                      value_materialized, value_kinds,
+                                      value_previews));
+  }
 }
 
 DebuggerStackTrace* DebuggerStackTrace::CollectAsyncAwaiters() {
@@ -2076,6 +2719,11 @@ DebuggerStackTrace* DebuggerStackTrace::From(const class StackTrace& ex_trace) {
       const auto& bytecode = Bytecode::Cast(code_object);
       function = bytecode.function();
       start = bytecode.PayloadStart();
+    } else if (code_object.IsString()) {
+      auto* const activation =
+          new ActivationFrame(String::Cast(code_object));
+      stack_trace->AddActivation(activation);
+      continue;
     }
     if (function.IsNull() || !function.is_visible()) continue;
     const uword pc = start + ex_trace.PcOffsetAtFrame(i);

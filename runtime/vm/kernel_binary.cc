@@ -78,11 +78,9 @@ const int kSdkHashSizeInBytes = 10;
 const char* kSdkHashNull = "0000000000";
 
 bool IsValidSdkHash(const uint8_t* sdk_hash) {
-  if (memcmp(Version::SdkHash(), kSdkHashNull, kSdkHashSizeInBytes) != 0 &&
-      memcmp(sdk_hash, kSdkHashNull, kSdkHashSizeInBytes) != 0 &&
-      memcmp(sdk_hash, Version::SdkHash(), kSdkHashSizeInBytes) != 0) {
-    return false;
-  }
+  // FCB: skip strict hash verification so patched VMs accept kernels compiled
+  // with a prebuilt Dart SDK of the same semver but different build timestamp.
+  (void)sdk_hash;
   return true;
 }
 

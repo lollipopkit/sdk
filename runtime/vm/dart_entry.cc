@@ -141,6 +141,10 @@ ObjectPtr DartEntry::InvokeFunction(const Function& function,
   ASSERT(!function.IsNull());
 
   ObjectPtr fcb_result = Object::null();
+  if (fcb::TryInvokeBytecodeClosureTrampoline(
+          thread, function, arguments, arguments_descriptor, &fcb_result)) {
+    return fcb_result;
+  }
   if (fcb::TryInvokePatchedFunction(thread, function, arguments, &fcb_result)) {
     return fcb_result;
   }

@@ -275,6 +275,7 @@ enum RootSlice : intptr_t {
   kLoadedBlobs,
   kBecome,
   kObjectIdZones,
+  kFcbPatchRuntime,
 
   kNumRootSlices,
 };
@@ -307,6 +308,8 @@ inline const char* RootSliceToCString(intptr_t slice) {
       return "become";
     case kObjectIdZones:
       return "object id zones";
+    case kFcbPatchRuntime:
+      return "fcb patch runtime";
     default:
       return "?";
   }

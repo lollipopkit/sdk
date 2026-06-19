@@ -239,6 +239,7 @@ class RuntimeEntry : public ValueObject {
 #define DECLARE_RUNTIME_ENTRY(name)                                            \
   extern const RuntimeEntry& k##name##RuntimeEntry;
 RUNTIME_ENTRY_LIST(DECLARE_RUNTIME_ENTRY)
+FCB_RUNTIME_ENTRY_LIST(DECLARE_RUNTIME_ENTRY)
 #undef DECLARE_RUNTIME_ENTRY
 
 #define DECLARE_RUNTIME_ENTRY(type, name, ...)                                 \

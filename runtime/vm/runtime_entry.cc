@@ -105,11 +105,6 @@ void TryFcbPatchCall(Thread* thread,
     arguments.SetReturn(Object::Handle(zone, result));
     return;
   }
-  if (fcb::TryInvokeUniquePatchedFunctionByArity(thread, call_arguments,
-                                                 &result)) {
-    arguments.SetReturn(Object::Handle(zone, result));
-    return;
-  }
   arguments.SetReturn(Object::sentinel());
 }
 
@@ -183,7 +178,12 @@ void TryFcbPatchStaticCallAot(Thread* thread,
       OS::PrintErr("FCB AOT dispatch handled target=%s\n",
                    function.ToFullyQualifiedCString());
     }
-    arguments.SetReturn(Object::Handle(zone, result));
+    const Array& wrapped_result = Array::Handle(zone, Array::New(2));
+    const intptr_t convention =
+        return_convention == fcb::ReturnConvention::kUnboxedInt64 ? 1 : 0;
+    wrapped_result.SetAt(0, Smi::Handle(zone, Smi::New(convention)));
+    wrapped_result.SetAt(1, Object::Handle(zone, result));
+    arguments.SetReturn(wrapped_result);
     return;
   }
   const Code& target_code = Code::Handle(zone, function.CurrentCode());

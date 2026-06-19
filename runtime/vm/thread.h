@@ -1434,6 +1434,7 @@ class Thread : public ThreadState, public IntrusiveDListEntry<Thread> {
 
 #define DECLARE_MEMBERS(name) uword name##_entry_point_;
   RUNTIME_ENTRY_LIST(DECLARE_MEMBERS)
+  FCB_RUNTIME_ENTRY_LIST(DECLARE_MEMBERS)
 #undef DECLARE_MEMBERS
 
   uword write_barrier_wrappers_entry_points_[kNumberOfDartAvailableCpuRegs];
@@ -1756,10 +1757,6 @@ class Thread : public ThreadState, public IntrusiveDListEntry<Thread> {
   friend Isolate* CreateWithinExistingIsolateGroup(IsolateGroup*,
                                                    const char*,
                                                    char**);
-
-#define DECLARE_MEMBERS(name) uword name##_entry_point_ = 0;
-  FCB_RUNTIME_ENTRY_LIST(DECLARE_MEMBERS)
-#undef DECLARE_MEMBERS
 
   DISALLOW_COPY_AND_ASSIGN(Thread);
 };

@@ -318,6 +318,7 @@ const Code& StubCodeSubtype7TestCache() {
 #define DEFINE_ALIAS(name)                                                     \
   const RuntimeEntry& k##name##RuntimeEntry(dart::k##name##RuntimeEntry);
 RUNTIME_ENTRY_LIST(DEFINE_ALIAS)
+FCB_RUNTIME_ENTRY_LIST(DEFINE_ALIAS)
 #undef DEFINE_ALIAS
 
 #define DEFINE_ALIAS(type, name, ...)                                          \

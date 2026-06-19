@@ -39,7 +39,6 @@ bool CpuInfo::FieldContains(CpuInfoIndices idx, const char* search_string) {
 
   ASSERT(HasField(field));
   if (sysctlbyname(field, dest, &dest_len, nullptr, 0) != 0) {
-    UNREACHABLE();
     return false;
   }
 
@@ -54,14 +53,14 @@ const char* CpuInfo::ExtractField(CpuInfoIndices idx) {
 
   ASSERT(HasField(field));
   if (sysctlbyname(field, nullptr, &result_len, nullptr, 0) != 0) {
-    UNREACHABLE();
-    return 0;
+    char* empty = reinterpret_cast<char*>(malloc(1));
+    empty[0] = '\0';
+    return empty;
   }
 
   char* result = reinterpret_cast<char*>(malloc(result_len));
   if (sysctlbyname(field, result, &result_len, nullptr, 0) != 0) {
-    UNREACHABLE();
-    return 0;
+    result[0] = '\0';
   }
 
   return result;
